@@ -1,0 +1,432 @@
+menu "SparkBot 固件配置"
+
+    menu "设备身份"
+
+        config SPARKBOT_DEVICE_NAME
+            string "设备显示名（上报给 PC，会出现在对话里）"
+            default "小星"
+            help
+                这个名字会随 hello 上报，PC 端用它称呼机器人。
+
+        config SPARKBOT_DEVICE_ID
+            string "设备唯一 id（留空则用芯片 MAC 自动生成）"
+            default ""
+            help
+                PC 用它做设备索引，同一 id 重连会替换旧连接。
+                留空时固件用 WiFi MAC 生成一个稳定 id，形如 esp32s3-a1b2c3。
+
+    endmenu
+
+    menu "网络"
+
+        config SPARKBOT_WIFI_SSID
+            string "WiFi SSID"
+            default ""
+
+        config SPARKBOT_WIFI_PASSWORD
+            string "WiFi 密码"
+            default ""
+
+        config SPARKBOT_WIFI_MAX_RETRY
+            int "连接失败重试次数"
+            default 10
+
+        config SPARKBOT_WIFI_TX_POWER_DBM
+            int "WiFi 发射功率 (dBm)"
+            range 8 20
+            default 11
+            help
+                摄像头 + WiFi 发射同时工作会有很大电流尖峰。
+                小电池供电时把发射功率降到 11dBm 左右能显著减少掉电重启。
+
+        config SPARKBOT_WIFI_POWER_SAVE
+            bool "启用 WiFi 省电（跟 AP 的 DTIM 睡觉）"
+            default n
+            help
+                打开能省几十 mA，但下行会晚约 100ms 醒来。
+                机器人要实时响应时建议关掉。
+
+    endmenu
+
+    menu "服务器连接"
+
+        config SPARKBOT_SERVER_HOST
+            string "PC 端 IP（SparkBot 服务所在机器）"
+            default "192.168.1.100"
+
+        config SPARKBOT_SERVER_PORT
+            int "PC 端端口"
+            default 8765
+
+        config SPARKBOT_SERVER_PATH
+            string "WebSocket 路径"
+            default "/robot"
+
+        config SPARKBOT_RECONNECT_INTERVAL_MS
+            int "断线重连间隔 (ms)"
+            default 3000
+
+        config SPARKBOT_HELLO_TIMEOUT_MS
+            int "等待 hello_ack 的超时 (ms)"
+            default 5000
+
+    endmenu
+
+    menu "LCD (SPI, ILI9341/ILI9342C)"
+
+        config SPARKBOT_LCD_ENABLE
+            bool "启用 LCD"
+            default y
+
+        config SPARKBOT_LCD_WIDTH
+            int "宽度"
+            default 320
+
+        config SPARKBOT_LCD_HEIGHT
+            int "高度"
+            default 240
+
+        config SPARKBOT_LCD_SCK_PIN
+            int "SPI SCK"
+            default 41
+
+        config SPARKBOT_LCD_MOSI_PIN
+            int "SPI MOSI"
+            default 40
+
+        config SPARKBOT_LCD_DC_PIN
+            int "DC / RS"
+            default 39
+
+        config SPARKBOT_LCD_CS_PIN
+            int "CS"
+            default 21
+
+        config SPARKBOT_LCD_BACKLIGHT_PIN
+            int "背光（PWM）"
+            default 42
+
+        config SPARKBOT_LCD_SPI_CLOCK_HZ
+            int "SPI 时钟频率"
+            default 40000000
+            help
+                40MHz 在多数排线下稳定；若出现花屏可降到 20000000。
+
+        config SPARKBOT_LCD_BACKLIGHT_PERCENT
+            int "默认背光亮度 (%)"
+            range 0 100
+            default 80
+
+        choice SPARKBOT_LCD_COLOR_ORDER
+            prompt "颜色通道顺序 (RGB/BGR)"
+            default SPARKBOT_LCD_COLOR_BGR
+            help
+                颜色不对时先调这个，再调下面的反色。
+                症状对照：
+                  * 黄变粉红 / 蓝红互换  -> 多半是这里选反了
+                  * 整个画面颜色"反相"（黑变白）-> 调反色开关
+
+                用 "colors" 诊断动作可以在屏幕上依次显示
+                红/绿/蓝/黄/白黑，直接看出哪个通道错了：
+                    POST /api/action {"action":"colors"}
+
+            config SPARKBOT_LCD_COLOR_RGB
+                bool "RGB"
+
+            config SPARKBOT_LCD_COLOR_BGR
+                bool "BGR"
+        endchoice
+
+        config SPARKBOT_LCD_INVERT
+            bool "反色 (INVON)"
+            default y
+            help
+                ILI9341 通常**需要**反色，ILI9342C 通常**不需要**。
+                本板是 ILI9342C，所以这个选项多半应当关掉。
+
+                注意：esp_lcd_ili9341 驱动本身不会自动发 INVON，
+                这个开关就是唯一的反色控制点，不会和驱动叠加。
+        
+    endmenu
+
+    menu "音频 (I2S + ES8311)"
+
+        config SPARKBOT_AUDIO_ENABLE
+            bool "启用音频"
+            default y
+
+        config SPARKBOT_AUDIO_SAMPLE_RATE
+            int "采样率"
+            default 16000
+            help
+                必须与 PC 端 SPARKBOT_SPEECH_INPUT_SAMPLE_RATE 一致（默认 16000）。
+                语音识别（ASR）对 16kHz 支持最好，也最省带宽。
+
+        config SPARKBOT_AUDIO_MCLK_PIN
+            int "I2S MCLK"
+            default 38
+
+        config SPARKBOT_AUDIO_BCLK_PIN
+            int "I2S BCLK"
+            default 14
+
+        config SPARKBOT_AUDIO_WS_PIN
+            int "I2S WS / LRCK"
+            default 13
+
+        config SPARKBOT_AUDIO_DOUT_PIN
+            int "I2S DOUT（板子 → codec，放音）"
+            default 45
+
+        config SPARKBOT_AUDIO_DIN_PIN
+            int "I2S DIN（codec → 板子，录音）"
+            default 12
+
+        config SPARKBOT_AUDIO_PA_PIN
+            int "PA 功放使能"
+            default 47
+
+        config SPARKBOT_AUDIO_I2C_SDA_PIN
+            int "控制 I2C SDA"
+            default 1
+
+        config SPARKBOT_AUDIO_I2C_SCL_PIN
+            int "控制 I2C SCL"
+            default 2
+
+        config SPARKBOT_AUDIO_CODEC_ADDR
+            hex "ES8311 I2C 地址"
+            default 0x30
+
+        config SPARKBOT_AUDIO_VOLUME
+            int "默认音量 (%)"
+            range 0 100
+            default 70
+
+        config SPARKBOT_AUDIO_MIC_GAIN_DB
+            int "麦克风增益 (dB)"
+            range 0 42
+            default 30
+
+        config SPARKBOT_AUDIO_CAPTURE_CHUNK_MS
+            int "音频上行分片时长 (ms)"
+            range 10 100
+            default 20
+            help
+                SparkBot 协议推荐 20ms（16kHz 单声道即 640 字节）。
+                分片越小延迟越低，但 JSON + base64 开销占比越高。
+
+    endmenu
+
+    menu "摄像头 (OV2640 DVP)"
+
+        config SPARKBOT_CAMERA_ENABLE
+            bool "启用摄像头"
+            default y
+
+        config SPARKBOT_CAMERA_XCLK_PIN
+            int "XCLK"
+            default 8
+
+        config SPARKBOT_CAMERA_PCLK_PIN
+            int "PCLK"
+            default 16
+
+        config SPARKBOT_CAMERA_VSYNC_PIN
+            int "VSYNC"
+            default 3
+
+        config SPARKBOT_CAMERA_HREF_PIN
+            int "HREF"
+            default 46
+
+        config SPARKBOT_CAMERA_PWDN_PIN
+            int "PWDN（-1 = 未接）"
+            default 48
+
+        config SPARKBOT_CAMERA_RESET_PIN
+            int "RESET（-1 = 未接）"
+            default -1
+
+        config SPARKBOT_CAMERA_SIOD_PIN
+            int "SIOD (SDA)"
+            default 1
+
+        config SPARKBOT_CAMERA_SIOC_PIN
+            int "SIOC (SCL)"
+            default 2
+
+        config SPARKBOT_CAMERA_D0_PIN
+            int "D0 (Y2)"
+            default 7
+        config SPARKBOT_CAMERA_D1_PIN
+            int "D1 (Y3)"
+            default 5
+        config SPARKBOT_CAMERA_D2_PIN
+            int "D2 (Y4)"
+            default 4
+        config SPARKBOT_CAMERA_D3_PIN
+            int "D3 (Y5)"
+            default 6
+        config SPARKBOT_CAMERA_D4_PIN
+            int "D4 (Y6)"
+            default 15
+        config SPARKBOT_CAMERA_D5_PIN
+            int "D5 (Y7)"
+            default 17
+        config SPARKBOT_CAMERA_D6_PIN
+            int "D6 (Y8)"
+            default 18
+        config SPARKBOT_CAMERA_D7_PIN
+            int "D7 (Y9)"
+            default 9
+
+        config SPARKBOT_CAMERA_XCLK_FREQ_HZ
+            int "XCLK 频率 (Hz)"
+            default 20000000
+
+        config SPARKBOT_CAMERA_JPEG_QUALITY
+            int "默认 JPEG 质量 (0~63，越小越清晰)"
+            range 0 63
+            default 12
+
+        config SPARKBOT_CAMERA_FB_COUNT
+            int "帧缓冲个数"
+            range 1 4
+            default 2
+
+    endmenu
+
+    menu "底盘电机（通用双路 H 桥）"
+
+        config SPARKBOT_MOTOR_ENABLE
+            bool "启用电机输出"
+            default n
+            help
+                本板默认没有电机驱动。打开后固件会用 GPIO + LEDC PWM
+                驱动两路 H 桥（TB6612 / DRV8833 / L298N 之类），
+                按差速模型把 linear/angular 换算成左右轮占空比。
+                PC 端只有在 hello 里看到 motor 能力才会开放运动类工具。
+
+        config SPARKBOT_MOTOR_LEFT_PWM_PIN
+            int "左轮 PWM"
+            default 10
+        config SPARKBOT_MOTOR_LEFT_IN1_PIN
+            int "左轮 IN1"
+            default 11
+        config SPARKBOT_MOTOR_LEFT_IN2_PIN
+            int "左轮 IN2（-1 = 单 PWM 模式）"
+            default -1
+
+        config SPARKBOT_MOTOR_RIGHT_PWM_PIN
+            int "右轮 PWM"
+            default 43
+        config SPARKBOT_MOTOR_RIGHT_IN1_PIN
+            int "右轮 IN1"
+            default 44
+        config SPARKBOT_MOTOR_RIGHT_IN2_PIN
+            int "右轮 IN2（-1 = 单 PWM 模式）"
+            default -1
+
+        config SPARKBOT_MOTOR_PWM_FREQ_HZ
+            int "PWM 频率 (Hz)"
+            default 20000
+            help
+                20kHz 超出人耳范围，电机不会啸叫；
+                有些驱动芯片上限较低，可按需降到 1000~5000。
+
+        config SPARKBOT_MOTOR_MAX_LINEAR
+            string "最大线速度 (m/s)"
+            default "0.6"
+
+        config SPARKBOT_MOTOR_MAX_ANGULAR
+            string "最大角速度 (rad/s)"
+            default "2.0"
+
+        config SPARKBOT_MOTOR_WHEEL_BASE_M
+            string "轮距 (m)"
+            default "0.15"
+
+        config SPARKBOT_MOTOR_DEADZONE_PERCENT
+            int "占空比死区 (%)"
+            range 0 60
+            default 0
+            help
+                小于该占空比时电机不转（静摩擦）。设定后固件会把
+                有效区间线性映射到 [死区, 100%]，低速时也能起步。
+
+    endmenu
+
+    menu "电源管理 (AXP2101)"
+
+        config SPARKBOT_POWER_ENABLE
+            bool "启用电源遥测（电池电压 / 电量）"
+            default y
+
+        config SPARKBOT_POWER_I2C_ADDR
+            hex "AXP2101 I2C 地址"
+            default 0x34
+
+        config SPARKBOT_POWER_POLL_MS
+            int "电量采样周期 (ms)"
+            default 5000
+
+    endmenu
+
+    menu "本地唤醒词"
+
+        config SPARKBOT_WAKE_WORD_ENABLE
+            bool "启用本地唤醒词（esp-sr AFE + WakeNet9）"
+            default n
+            help
+                打开后设备本地识别唤醒词，命中即向 PC 上报 wake_word 事件，
+                PC 侧语音闭环会自动开始一轮对话，不再需要手动点按钮。
+
+                具体用哪个唤醒词由 esp-sr 的 "ESP Speech Recognition ->
+                Select wake words" 决定（本工程在 sdkconfig.defaults 里
+                预设为 wn9_hixiaoxing_tts，即 "Hi,小星"）。
+
+                重要限制：当前实现只在**采集窗口内**检测唤醒词，
+                因为麦克风平时是关闭的（靠 codec 静音位控制）。
+                详见 main/bot_wakeword.c 顶部的说明。
+
+        config SPARKBOT_WAKE_WORD_LOG_LEVEL
+            int "唤醒相关日志等级 (2=WARN 3=INFO 4=DEBUG)"
+            range 0 5
+            default 3
+
+    endmenu
+
+    # ------------------------------------------------------------------ #
+    # 补一个 esp-sr 2.4.7 漏掉的唤醒词选项：Hi,小星
+    # ------------------------------------------------------------------ #
+    # 背景：esp-sr 2.4.7 **自带** `model/wakenet_model/wn9_hixiaoxing_tts`
+    # 这套模型数据（284KB，实际发音 "Hi,小星"），但它没有在
+    # "Load Multiple Wake Words (WakeNet9)" 菜单里开放对应开关。
+    #
+    # 而它的模型打包脚本（model/movemodel.py）是**纯按 sdkconfig 推导**
+    # 模型目录名的：
+    #     CONFIG_SR_WN_WN9_HIXIAOXING_TTS=y
+    #       → label.split("_SR_WN_")[-1].lower() = "wn9_hixiaoxing_tts"
+    #       → 去 model/wakenet_model/ 下找同名目录并打包
+    # 找不到目录时它**静默跳过**，最终产出 0 字节的 srmodels.bin，
+    # 表现为"分区挂载成功但一个有模型都没有"。
+    #
+    # 所以只要在这里补上同名的 config，打包就会正常工作，
+    # 用的是 esp-sr 自带的那套模型数据。符号名必须与目录名严格对应。
+    #
+    # 注意：本文件属于本工程，不会被组件管理器覆盖；
+    # 但升级 esp-sr 时要确认新版本里模型目录名是否变了。
+    config SR_WN_WN9_HIXIAOXING_TTS
+        bool "Hi,小星 (wn9_hixiaoxing_tts)"
+        default False
+        help
+            esp-sr 自带的 "Hi,小星" 唤醒词模型。
+
+            官方开放列表里**没有** "你好小星"（自定义训练需 ≥2 万条语料、
+            2~3 周、付费），"Hi,小星" 是音最接近且零成本的选项。
+
+            勾选后模型会被打包进 `model` 分区，同时在 sdkconfig 里
+            出现 CONFIG_SR_WN_WN9_HIXIAOXING_TTS=y。
+
+endmenu

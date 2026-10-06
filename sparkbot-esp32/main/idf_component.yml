@@ -1,0 +1,38 @@
+## SparkBot 固件依赖清单
+##
+## 全部使用 espressif 官方组件。
+##
+## 许可注意：esp-sr 组件本身及其**预编译唤醒词模型**有不同的条款。
+## 见 README「许可」一节 —— 别把"esp-sr"当成和 esp32-camera 一样的
+## 纯 Apache-2.0 组件。
+##
+## 版本**刻意锁死**（== 而不是 ^）。踩过的坑：
+##   用 ^2.0.0 拉到了较新的 esp32-camera，那一版改用 legacy I2C 驱动
+##   （i2c_param_config / i2c_master_cmd_begin），与本工程使用的
+##   IDF v5 新 i2c_master 驱动不兼容，结果 sccb_i2c_port 指定的总线
+##   用不了，摄像头探测始终失败（Detected camera not supported）。
+##   2.1.7 这一版用的是新 i2c_master，能正确共用已有总线。
+
+dependencies:
+  idf: ">=5.0"
+
+  # OV2640 DVP 摄像头驱动：帧缓冲管理 + JPEG 编码
+  espressif/esp32-camera: "==2.1.7"
+
+  # 音频 codec 抽象层，内含 ES8311 驱动（I2C 控制 + I2S 数据）
+  espressif/esp_codec_dev: "==1.5.11"
+
+  # ILI9341/ILI9342C SPI 面板驱动
+  espressif/esp_lcd_ili9341: "==1.2.0"
+
+  # 语音识别框架：用其中的 AFE + WakeNet 做本地唤醒词。
+  #
+  # 版本锁定到 2.4.7，与同芯片（ESP32-S3）、同 IDF（5.5.4）的
+  # 已验证可用工程（xiaozhi-esp32）保持一致。这一点很关键：
+  # 1.9.5 与 2.x 的 AFE **配置 API 完全不同** ——
+  #   1.9.5 只能手工填 AFE_CONFIG_DEFAULT()，而 2.x 提供了
+  #   `afe_config_init(input_format, models, type, mode)`，由它按输入
+  #   通道格式（"M" / "MR" 等）推导出整套内部参数。
+  #   我们手工填的配置始终让 `fetch()` 返回 ret=-1（内部流水线不产出），
+  #   实测无解；换成 2.4.7 + afe_config_init() 才是已验证的路径。
+  espressif/esp-sr: "==2.4.7"

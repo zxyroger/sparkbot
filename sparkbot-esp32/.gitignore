@@ -1,0 +1,13 @@
+# ESP-IDF 构建产物
+build/
+
+# 组件管理器拉取的依赖（可由 main/idf_component.yml 还原）
+managed_components/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 编辑器
+.vscode/
+.idea/

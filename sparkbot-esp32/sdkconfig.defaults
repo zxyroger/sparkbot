@@ -1,0 +1,123 @@
+# SparkBot 固件 SDK 默认配置（ESP32-S3-N16R8：16MB Flash + 8MB PSRAM）
+#
+# 用法：idf.py set-target esp32s3 时自动应用；
+#       改动本文件后需先 idf.py fullclean 再 build 才会生效。
+
+CONFIG_IDF_TARGET="esp32s3"
+
+# ---- Flash / 分区 ---------------------------------------------------------
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_16m.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions_16m.csv"
+
+# ---- PSRAM ---------------------------------------------------------------
+# 摄像头帧缓冲（VGA JPEG 一帧可达 100KB+）必须放 PSRAM，
+# 否则内部 RAM 会被瞬间吃光，WiFi 与显示都会开始失败。
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# ---- 控制台 --------------------------------------------------------------
+# 日志走原生 USB 串口（GPIO19/20），把 UART0 的 TX/RX 腾出来做普通 GPIO。
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+
+# ---- WebSocket 协议栈 ----------------------------------------------------
+# 握手要用 SHA1；base64 由 mbedtls 提供。
+CONFIG_MBEDTLS_SHA1_C=y
+CONFIG_MBEDTLS_BASE64_C=y
+
+# 协议层与主循环的栈要够深：JSON 解析 + 摄像头抓帧 + 音频回调都是调用栈大户。
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_HTTPD_TASK_STACK_SIZE=8192
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384
+CONFIG_LWIP_TCP_RCV_BUF_DEFAULT=16384
+
+# 板子同时只服务一个客户端，但 TCP 队列留点余量，避免重连时丢握手包。
+CONFIG_LWIP_MAX_SOCKETS=10
+
+# ---- 摄像头 --------------------------------------------------------------
+# 用 PSRAM 存帧缓冲，双缓冲以便一边发一边拍。
+CONFIG_SPIRAM_CACHE_WORKAROUND=n
+CONFIG_CAMERA_CORE0=y
+CONFIG_CAMERA_TASK_STACK_SIZE=4096
+
+# ---- 编译器 --------------------------------------------------------------
+# 摄像头与 JPEG 编码路径对性能敏感，用 -O2。
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# ---- FreeRTOS ------------------------------------------------------------
+# 打开任务状态查询（uxTaskGetSystemState）。
+# 唤醒词调试用得上：要把系统任务表打出来，确认 esp-sr 的 AFE 内部任务
+# （afe_mase / afe_se_task）是否存在、优先级多少、是否在跑。
+# 代价是每任务多几个字节的统计开销，可以忽略。
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y
+
+# ---- SparkBot 部署配置 ---------------------------------------------------
+# 这些是本机实测用的值。改完需要 fullclean 再 build 才会完全生效，
+# 但 sdkconfig 里已存在的同名项优先，所以更推荐用 menuconfig 改。
+
+# 设备身份
+CONFIG_SPARKBOT_DEVICE_NAME="小星"
+
+# 网络（板子只能连 2.4GHz）
+CONFIG_SPARKBOT_WIFI_SSID=""
+CONFIG_SPARKBOT_WIFI_PASSWORD=""
+
+# PC 端服务地址（WLAN 网卡地址，板子要连的是这个而不是 127.0.0.1）
+CONFIG_SPARKBOT_SERVER_HOST="192.168.0.106"
+CONFIG_SPARKBOT_SERVER_PORT=8765
+CONFIG_SPARKBOT_SERVER_PATH="/robot"
+
+# 摄像头：模组当前未在 I2C 上应答（见 README 排查记录），
+# 先关掉让启动日志干净，等硬件确认后再打开。
+CONFIG_SPARKBOT_CAMERA_ENABLE=n
+
+# 电机：本板没有电机驱动，保持关闭。
+CONFIG_SPARKBOT_MOTOR_ENABLE=n
+
+# ---- 本地唤醒词（esp-sr AFE + WakeNet9）--------------------------------
+# 打开后设备能本地识别唤醒词，命中即向 PC 上报 wake_word 事件，
+# PC 侧语音闭环会自动开始一轮对话。唤醒词是 **"Hi,小星"**。
+CONFIG_SPARKBOT_WAKE_WORD_ENABLE=y
+
+# esp-sr 2.4.7 的开关名与 1.9.x 不同（1.9.x 是 CONFIG_USE_AFE /
+# CONFIG_USE_WAKENET，在 2.4.7 里已不存在）。这里只管两类：
+#   * 唤醒词模型选择（CONFIG_SR_WN_*，由 movemodel.py 读取）
+#   * VAD 模型选择（CONFIG_SR_VADN_*）
+# 2.4.7 没有独立的 AFE 总开关，选了模型就会启用。
+#
+# VAD：WebRTC 版，**不需要额外模型文件**（afe_config_init 里传
+# vad_model_name=NULL 时用的就是它）。
+CONFIG_SR_VADN_WEBRTC=y
+
+# 唤醒词模型：Hi,小星。
+#
+# 这个符号由本工程的 main/Kconfig.projbuild 补上 —— esp-sr 2.4.7
+# 自带了 wn9_hixiaoxing_tts 的模型数据，却没在它的 Kconfig 菜单里开放，
+# 导致 movemodel.py 找不到该 config（静默产出 0 字节 srmodels.bin）。
+CONFIG_SR_WN_WN9_HIXIAOXING_TTS=y
+
+# 不用的模型一律关掉：esp-sr 把选中的模型打包进 model 分区，多选白占 Flash。
+CONFIG_USE_NSNET=n
+CONFIG_USE_MULTINET=n
+
+# ---- LCD 颜色配置（本板 ILI9342C，已实测验证）-------------------------
+# 本板屏幕是 ILI9342C，不是 ILI9341 —— 两者的颜色行为不同：
+#   ILI9341  **需要**反色 (INVON)
+#   ILI9342C **不需要**反色
+# esp_lcd_ili9341 驱动能驱动 ILI9342C，但它自己不会发 INVON，
+# 反色完全由调用方决定。
+#
+# 原来的代码照 ILI9341 写死了 invert=true，于是 ILI9342C 上
+# 黄色 (0xFDC0) 显示成粉红。实测确认下面这组是对的：
+#   BGR + 不反色  ->  黄色正常
+CONFIG_SPARKBOT_LCD_COLOR_BGR=y
+# CONFIG_SPARKBOT_LCD_INVERT is not set

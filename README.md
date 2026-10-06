@@ -341,7 +341,7 @@ Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -like '192.16
 不一致就改掉并重烧：
 
 ```bat
-cd D:\dsh\sparkbot-esp32
+cd D:\dsh\sparkbot\sparkbot-esp32
 python tools\set_server_host.py 192.168.0.103     :: 填 PC 当前 IP
 build.bat build
 build.bat flash COM15
@@ -626,6 +626,7 @@ stop_all.bat        Windows 一键停止
 start_all.ps1       PowerShell 等价入口（受执行策略限制，见脚本内说明）
 check.py            启动前自检：一条命令定位「为什么起不来」
 tests/              三个测试套件 + 手动联调脚本
+sparkbot-esp32/     ESP32-S3 固件源码（ESP-IDF 工程，见其 README）
 logs/               脚本启动时的运行日志（.gitignore 已忽略）
 ```
 

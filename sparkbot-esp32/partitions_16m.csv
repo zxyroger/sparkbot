@@ -1,0 +1,21 @@
+# SparkBot 固件分区表（16MB Flash）
+#
+# 为什么需要自定义分区表：
+#   * 应用体积较大（摄像头 + 音频 codec + LCD + WebSocket 协议栈），
+#     默认的 1MB factory 分区放不下，这里给到 4MB；
+#   * 语音唤醒模型要放在**标签必须叫 `model`** 的分区里 ——
+#     esp-sr 的构建脚本按这个名字查找并自动烧写 srmodels.bin，
+#     改名或漏掉会导致构建报 "Failed to find model in partition table file"；
+#   * 预留一个 64KB 的 coredump 分区，固件崩溃时能拿到回溯；
+#   * 其余空间留给应用数据，暂不做双 OTA（机器人是场内设备，
+#     重新烧写比 OTA 更常见）。
+
+# Name,     Type, SubType, Offset,   Size,   Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+phy_init,   data, phy,     0xf000,   0x1000,
+factory,    app,  factory, 0x10000,  4M,
+coredump,   data, coredump,0x410000, 0x10000,
+# 唤醒词模型分区。实测 wn9_hixiaoxing_tts（"Hi,小星"）只有约 284KB，
+# 但 esp-sr 还会打包其它已选模型与索引，给 1MB 留足余量。
+model,      data, spiffs,  0x420000, 0x100000,
+storage,    data, spiffs,  0x520000, 0xAE0000,
