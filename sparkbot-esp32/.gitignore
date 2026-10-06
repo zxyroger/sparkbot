@@ -1,6 +1,9 @@
 # ESP-IDF 构建产物
 build/
 
+# 本地生成的配置：含 WiFi 凭据等，绝不入库（模板见 sdkconfig.defaults）
+/sdkconfig
+
 # 组件管理器拉取的依赖（可由 main/idf_component.yml 还原）
 managed_components/
 
