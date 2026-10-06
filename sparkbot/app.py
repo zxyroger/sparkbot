@@ -1007,9 +1007,8 @@ _CONSOLE_HTML = """<!DOCTYPE html>
   <section>
     <h2>串口日志</h2>
     <p class="field hint" style="margin-top:-4px">
-      服务端独占打开串口，把固件输出通过网络推到本页。<b>串口同一时刻只能被一个程序打开</b>——
-      本页打开期间，命令行工具 <code>tools/serial_log.py</code> 和
-      <code>esp32gw.exe</code> 都会失败，用完请点「关闭串口」。
+      服务端独占打开串口，把固件输出通过网络推到本页。<b>串口同一时刻只能被一个程序打开</b>，
+      用完请点「关闭串口」释放出去。
     </p>
     <div class="bar" style="flex-wrap:wrap;gap:8px">
       <label class="field" style="flex-direction:row;align-items:center;gap:6px">

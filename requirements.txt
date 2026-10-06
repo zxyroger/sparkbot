@@ -12,6 +12,12 @@ python-dotenv>=1.0
 # ---- Console ------------------------------------------------------------
 rich>=13.9
 
+# ---- Console: serial log tab --------------------------------------------
+# 控制台的「串口日志」标签页要靠它枚举/打开串口。缺了它服务端会回报
+# pyserial:false，页面显示"未检测到串口"（而不是"没有串口"）。
+# 纯 Python 包，没有编译依赖。
+pyserial>=3.5
+
 # ---- Optional: real cloud ASR/TTS --------------------------------------
 # openai>=1.60          # enables OpenAI/DeepSeek-compatible ASR + TTS providers
 # soundfile>=0.12       # decode/encode wav for cloud TTS output
