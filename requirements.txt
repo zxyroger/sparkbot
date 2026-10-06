@@ -1,0 +1,21 @@
+# ---- Core runtime -------------------------------------------------------
+fastapi>=0.115
+uvicorn[standard]>=0.34
+websockets>=14.1
+httpx>=0.28
+
+# ---- Config -------------------------------------------------------------
+pydantic>=2.10
+pydantic-settings>=2.7
+python-dotenv>=1.0
+
+# ---- Console ------------------------------------------------------------
+rich>=13.9
+
+# ---- Optional: real cloud ASR/TTS --------------------------------------
+# openai>=1.60          # enables OpenAI/DeepSeek-compatible ASR + TTS providers
+# soundfile>=0.12       # decode/encode wav for cloud TTS output
+
+# ---- Optional: local offline vision (mutually exclusive with cloud VLM) --
+# ultralytics>=8.3      # YOLO object detection fallback
+# opencv-python>=4.10   # frame decode / drawing overlays

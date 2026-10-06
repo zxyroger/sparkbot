@@ -1,0 +1,21 @@
+# 依赖安装目录（工作区内，不污染系统 Python）
+.vendor/
+
+# 运行期产物：抓拍的帧、缓存的音频
+artifacts/
+
+# 启动脚本写的运行日志与进程号
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 环境与密钥
+.env
+*.local
+
+# 编辑器
+.vscode/
+.idea/
