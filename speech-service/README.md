@@ -1,4 +1,4 @@
-# 本地语音服务（SenseVoice ASR）
+# 本地语音服务（SenseVoice ASR + Kokoro TTS）
 
 CPU 上本地部署的语音识别服务，提供 OpenAI 兼容接口，供 `D:\dsh\sparkbot`
 主项目调用。**不需要 GPU、不需要云 API、不产生费用。**
@@ -213,8 +213,13 @@ Python **3.13.15**（已验证可用；`torch` / `onnxruntime` / `numpy`
 | kaldi-native-fbank | 1.22.3 |
 | fastapi / uvicorn | 0.142.2 / 0.54.0 |
 | modelscope | 1.40.1 |
+| kokoro-onnx | 0.6.1（TTS，纯 ONNX） |
+| misaki-fork[zh] | 0.9.6（中文 G2P，需 `--ignore-requires-python`） |
+| sherpa-onnx | 1.13.8（TTS，默认引擎，原生 16kHz） |
+| edge-tts | 7.2.8（仅作兜底） |
 
-磁盘占用：venv 约 1GB + 模型 896MB + pip 缓存（在 `D:\dsh\.tmp`）。
+磁盘占用：venv 约 1GB + ASR 模型 896MB + sherpa 模型 131MB +
+Kokoro 模型约 450MB + pip 缓存（在 `D:\dsh\.tmp`）。
 
 ---
 
@@ -249,21 +254,171 @@ Python **3.13.15**（已验证可用；`torch` / `onnxruntime` / `numpy`
 
 ---
 
-## 尚未部署：TTS
+## TTS：sherpa-onnx（默认）/ Kokoro（备选）
 
-主项目还需要 `/v1/audio/speech`（文本转语音）才能真正"对话"。
-目前 `speech.tts_provider` 仍是 `mock`，板子只会发出高低音。
+`tts_server.py` 提供 `/v1/audio/speech`，主项目把 `speech.tts_provider`
+设成 `openai`、base_url 指向本服务即可。服务内置三个离线/在线引擎，
+请求里的 `model` 字段直接选，PC 端改 `speech.tts_model` 就能热切换，
+不用重启：
 
-**CosyVoice2 的情况与本服务不同**：
+| `model` | 引擎 | 输出采样率 | 音色 |
+|---|---|---|---|
+| `sherpa`（默认） | sherpa-onnx VITS 中文 | **原生 16kHz** | `sid_0` ~ `sid_186`（187 个说话人） |
+| `kokoro` | Kokoro-82M v1.1-zh | 24kHz（服务端重采样到 16k） | `zf_001` 等 103 个 |
+| `edge` | 微软 edge-tts（在线） | 24kHz | edge 中文音色名 |
 
-- 官方**没有** OpenAI 兼容服务，需要自己写 `/v1/audio/speech` 端点
-  （约 80 行，参考本项目 `server.py` 的结构）
-- 模型约 1.5GB，CPU 上合成一句话预计 **3~15 秒**，对话会有明显停顿
-- 输出采样率约 22.05kHz，而板子要 16kHz —— 好消息是固件里
-  `bot_audio_play()` **已实现自动线性重采样**，不需要额外处理
+### 为什么默认是 sherpa-onnx
 
-CPU 场景下更轻的替代：`edge-tts`（调微软免费接口，几乎零延迟、
-音质好），代价是走网络、非完全离线。
+关键在采样率。板子 I2S 固定 16kHz，而固件里的重采样函数
+`resample_s16_mono` 是**线性插值**、没有抗混叠滤波 —— 24k→16k 会把
+8kHz 以上的成分折叠回来，齿音发毛、听感明显不自然。
+
+sherpa 的中文 VITS 模型**原生输出 16kHz**，与板子完全一致，整条链路
+连重采样这一步都不存在，直接绕开了这个问题。
+
+其余实测对比（i5-11400，纯 CPU，同一句话）：
+
+| | sherpa-onnx | Kokoro |
+|---|---|---|
+| 模型加载 | **0.9s** | 3.5s |
+| 合成速度 | **RTF ≈ 0.30** | RTF ≈ 0.40 |
+| 输出采样率 | **16kHz（原生）** | 24kHz（需重采样） |
+| 音色数量 | **187** | 103 |
+| 许可 | Apache-2.0 | Apache-2.0 |
+
+### 为什么换掉 edge-tts
+
+最初用的是 edge-tts（调微软免费接口）。它音质不错、延迟也低，但**是在线服务**，
+实测会返回 502/503（`Invalid response status` / `No audio was received`），
+机器人播报直接失败。对话机器人不能把"能不能出声"押在不保证可用的免费接口上。
+
+### sherpa 的安装与模型下载
+
+```powershell
+# 1) 装 sherpa-onnx（二进制 wheel，国内走清华镜像）
+.venv\Scripts\python.exe -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple sherpa-onnx
+
+# 2) 下模型（131MB / 17 个文件）。GitHub Releases 国内极慢，走 HF 镜像。
+$root = "models\sherpa\vits-zh-hf-fanchen-C"
+$base = "https://hf-mirror.com/csukuangfj/vits-zh-hf-fanchen-C/resolve/main"
+$files = @("vits-zh-hf-fanchen-C.onnx","lexicon.txt","tokens.txt",
+           "date.fst","phone.fst","number.fst","new_heteronym.fst","G_C.json",
+           "dict/hmm_model.utf8","dict/idf.utf8","dict/jieba.dict.utf8",
+           "dict/stop_words.utf8","dict/user.dict.utf8",
+           "dict/pos_dict/char_state_tab.utf8","dict/pos_dict/prob_emit.utf8",
+           "dict/pos_dict/prob_start.utf8","dict/pos_dict/prob_trans.utf8")
+New-Item -ItemType Directory -Path $root -Force | Out-Null
+foreach ($f in $files) {
+    $dst = Join-Path $root $f
+    New-Item -ItemType Directory -Path (Split-Path $dst -Parent) -Force | Out-Null
+    curl.exe -L -s -o $dst "$base/$f"
+}
+```
+
+声线直接用**说话人编号**：请求里的 `voice` 写 `sid_0` ~ `sid_186`，
+不在这个范围就回落到默认说话人（`DEFAULT_SHERPA_SID`）。想挑音色就依次
+改 `speech.tts_voice` 试听。
+
+### 备选引擎：Kokoro（中文音色更多）
+
+| 项 | 值 |
+|---|---|
+| 许可 | MIT |
+| 体积 | 82M 参数，fp32 ONNX 324MB |
+| 硬件 | 纯 CPU，不需要 GPU |
+| 延迟 | 本机 RTF ≈ 0.37~0.56（比实时快 2~3 倍） |
+| 中文 | 有专门的中文模型 Kokoro-82M-v1.1-zh 与成体系的中文声线 |
+
+实测（i5-11400，纯 CPU）：
+
+```
+16 字 -> 3.25s 音频, 总计 1322ms | RTF 0.407
+37 字 -> 7.01s 音频, 总计 2609ms | RTF 0.372
+```
+
+### 必须用 fp32 模型（重要）
+
+同一份模型的 **int8 量化版在本机 RTF ≈ 3.8，比实时慢 4 倍**，
+反而比 fp32 慢约 9 倍。x86 上 ORT 的量化卷积/矩阵乘内核在这个小模型上
+不占优，还要额外承担量化/反量化开销。所以固定加载
+`kokoro-v1.1-zh.fp32.onnx`，**不要换成 int8**。
+
+（int8 实测：4/6/12 线程分别 RTF 4.05 / 3.98 / 3.89 —— 瓶颈不是线程调度。）
+
+### Kokoro 的安装与模型下载
+
+模型文件较大（约 450MB），**不入库**（`.gitignore` 里已排除 `models/`）。
+换台机器要重新准备一次：
+
+```powershell
+# 1) 装依赖。misaki 声明 Python<3.13，但它是纯 Python 包，
+#    实测在 3.13 上工作正常，用 --ignore-requires-python 绕过即可。
+#    国内必须加镜像，否则 PyPI 慢到不可用（实测 10 KB/s）。
+$mirror = "https://pypi.tuna.tsinghua.edu.cn/simple"
+.venv\Scripts\python.exe -m pip install -i $mirror kokoro-onnx
+.venv\Scripts\python.exe -m pip install -i $mirror --ignore-requires-python "misaki-fork[zh]"
+
+# 2) 下模型。HuggingFace 直连不通，用 hf-mirror 镜像。
+$dir  = "models\kokoro"
+$base = "https://hf-mirror.com/onnx-community/Kokoro-82M-v1.1-zh-ONNX/resolve/main"
+New-Item -ItemType Directory -Path "$dir\voices" -Force | Out-Null
+
+#    fp32 模型（324MB）—— 必须用这个，别用 int8
+curl.exe -L -o "$dir\kokoro-v1.1-zh.fp32.onnx" "$base/onnx/model.onnx"
+
+#    词表（misaki 的音素 -> ID 映射）
+curl.exe -L -o "$dir\config.json" `
+    "https://hf-mirror.com/hexgrad/Kokoro-82M-v1.1-zh/raw/main/config.json"
+
+#    声线：按需挑 zf_*.bin（女）/ zm_*.bin（男），每个 510KB
+foreach ($n in "zf_001","zf_002","zf_003","zm_009","zm_010","zm_011") {
+    curl.exe -L -o "$dir\voices\$n.bin" "$base/voices/$n.bin"
+}
+
+# 3) 散装声线打包成 kokoro-onnx 要的 npz
+#    （每个文件是 510x256 的 float32，np.load 读的就是这个 npz）
+.venv\Scripts\python.exe -c @"
+import numpy as np, pathlib
+d  = pathlib.Path(r'models/kokoro')
+vs = {f.stem: np.fromfile(f, np.float32).reshape(-1, 1, 256)
+      for f in sorted((d / 'voices').glob('*.bin'))}
+np.savez(d / 'voices-zh.npz', **vs)
+print('voices:', sorted(vs))
+"@
+```
+
+### 声线映射
+
+PC 端 `.env` 里写的是 edge 风格的名字，服务内部做一次映射：
+
+| 请求里的 voice | 实际用的 Kokoro 声线 |
+|---|---|
+| `zh-CN-XiaoxiaoNeural` | `zf_001` |
+| `zh-CN-XiaoyiNeural` | `zf_002` |
+| `zh-CN-YunxiNeural` | `zm_009` |
+| `zh-CN-YunjianNeural` | `zm_010` |
+| `zh-CN-YunyangNeural` | `zm_011` |
+| `zh-CN-YunxiaNeural` | `zm_012` |
+
+直接传 Kokoro 声线名（`zf_001` 等）也可以。想换音色不必动 PC 端配置，
+用 `--voice zf_003` 启动本服务即可。
+
+### 排障开关
+
+| 命令 | 行为 |
+|---|---|
+| `start_tts.bat` | 默认 `auto`：Kokoro 优先，失败回落 edge-tts |
+| `tts_server.py --engine kokoro` | 只用 Kokoro（离线） |
+| `tts_server.py --engine edge` | 只用 edge-tts（在线，用来对比排障） |
+
+`GET /health` 会回报 `kokoro_ready` / `kokoro_error` / `voices`；
+`POST /v1/audio/speech` 的响应头带 `X-TTS-Engine`，标明这次实际用了哪个引擎。
+
+### 已知限制
+
+misaki 的中文 G2P 在没有英文前端时会丢掉英文单词（启动时打印
+`en_callable is None, so English may be removed`）。当前机器人回复以中文为主，
+暂不处理；若以后回复里常夹英文，需要给 `ZHG2P` 传一个英文 `en_callable`。
 
 ---
 
@@ -273,6 +428,10 @@ CPU 场景下更轻的替代：`edge-tts`（调微软免费接口，几乎零延
 |---|---|
 | `server.py` | ASR 服务（FastAPI，OpenAI 兼容） |
 | `start_asr.bat` | 启动脚本（含全部环境变量处理） |
+| `tts_server.py` | TTS 服务（Kokoro 离线 + edge-tts 兜底） |
+| `start_tts.bat` | TTS 启动脚本 |
+| `models/kokoro/` | Kokoro 模型与声线（约 450MB，可删，见上文重新下载） |
+| `models/sherpa/` | sherpa-onnx 模型（131MB，可删，见上文重新下载） |
 | `benchmark.py` | 实测脚本：准确率（CER）+ 延迟（RTF） |
 | `bench/` | 基准测试生成的音频 |
 | `modelscope-cache/` | 模型缓存（896MB，可删，删后重新下载） |

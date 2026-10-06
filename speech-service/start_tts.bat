@@ -30,7 +30,10 @@ setlocal
 set PORT=%1
 if "%PORT%"=="" set PORT=8761
 set VOICE=%2
-if "%VOICE%"=="" set VOICE=zh-CN-XiaoxiaoNeural
+REM Default engine is sherpa-onnx, whose voices are speaker ids ("sid_N").
+REM Kokoro names (zf_005) and edge names still work - they are resolved in
+REM tts_server.py - and the client (PC .env) normally sends its own voice.
+if "%VOICE%"=="" set VOICE=sid_2
 
 cd /d "%~dp0"
 

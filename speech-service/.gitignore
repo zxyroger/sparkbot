@@ -4,6 +4,9 @@
 # ModelScope 模型缓存（约 900MB，首次运行自动下载）
 modelscope-cache/
 
+# Kokoro 语音模型（约 450MB，见 README/tts_server.py 的下载说明）
+models/
+
 # 运行期 HOME：内含 .modelscope 凭据，绝不能入库
 home/
 
@@ -13,6 +16,9 @@ torchinductor_*/
 # Python
 __pycache__/
 *.py[cod]
+
+# jieba 分词缓存（misaki 中文 G2P 在服务目录里落地）
+jieba.cache
 
 # 基准测试输出（音频样本）
 bench/
