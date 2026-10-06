@@ -54,8 +54,8 @@ goto parse
 
 set ASR_PORT=8760
 set TTS_PORT=8761
-set SPEECH_DIR=%~dp0..\speech-service
-if not exist "%SPEECH_DIR%\" set SPEECH_DIR=D:\dsh\speech-service
+set SPEECH_DIR=%~dp0speech-service
+if not exist "%SPEECH_DIR%\" set SPEECH_DIR=%~dp0..\speech-service
 
 if not exist "logs" mkdir "logs"
 
