@@ -25,6 +25,7 @@ from typing import Any
 
 from ..config import Settings
 from ..core.errors import DeviceError, DeviceOfflineError, SparkBotError
+from ..perception.face import FaceObservation, FaceScan, decode_feat_b64
 from .gateway import DeviceConnection, DeviceGateway, Frame
 from .protocol import Action, EventName, Emotion
 
@@ -436,6 +437,54 @@ class Robot:
             },
         )
         return {"ok": True, "enabled": enabled, "fps": fps}
+
+    async def identify_faces(self, *, timeout_ms: int | None = None) -> FaceScan:
+        """让设备**在芯片上跑一次人脸推理**，返回检测到的脸与特征向量。
+
+        与 :meth:`look` 的分工：``look`` 把整帧 JPEG 传回 PC，回答"周围有什么"；
+        这里只回 512 维特征，回答"这是谁"。特征只有 2.7KB，而推理在设备端
+        完成 —— 设备不需要存名字，PC 也不需要装人脸模型。
+
+        设备侧一张脸约 0.4 秒（MSR+MNP 检测 + MFN 提特征），所以超时给得
+        比普通命令宽；一帧里最多回来 4 张脸。
+
+        Raises:
+            CapabilityError: 设备没有摄像头。
+            DeviceError: 设备执行失败（例如人脸模型没加载起来）。
+        """
+        self.require(CAP_CAMERA)
+        envelope = await self.conn.command(
+            Action.FACE_IDENTIFY,
+            {},
+            timeout_ms=int(
+                timeout_ms or max(self.settings.device.command_timeout_ms, 15_000)
+            ),
+        )
+
+        data = envelope.data
+        scan = FaceScan(width=int(data.get("width") or 0), height=int(data.get("height") or 0))
+        for raw in data.get("faces") or []:
+            if not isinstance(raw, dict):
+                continue
+            feature = decode_feat_b64(str(raw.get("feat_b64") or ""))
+            if not feature:
+                # 特征解码失败就跳过这张脸：宁可少认一个人，
+                # 也不能拿一段长度不对的向量去算相似度（会静默认错人）。
+                logger.warning("设备 %s 回传的人脸特征无法解码，已跳过", self.device_id)
+                continue
+            scan.faces.append(
+                FaceObservation(
+                    box=(
+                        int(raw.get("x1") or 0),
+                        int(raw.get("y1") or 0),
+                        int(raw.get("x2") or 0),
+                        int(raw.get("y2") or 0),
+                    ),
+                    score=float(raw.get("score") or 0.0),
+                    feat=feature,
+                )
+            )
+        return scan
 
     # ------------------------------------------------------------------ #
     # 音频

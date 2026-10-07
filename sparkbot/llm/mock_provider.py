@@ -30,6 +30,11 @@ logger = logging.getLogger(__name__)
 #: 里有一条断言专门守着这个一致性。
 _RULES: list[tuple[tuple[str, ...], str, dict[str, Any]]] = [
     (("你好", "您好", "嗨", "在吗", "hello", "hi"), "show_emotion", {"emotion": "happy"}),
+    # 人脸规则必须排在「看…什么」那条**前面**：中文里"谁"和"什么"经常
+    # 同时出现（"你看到谁了？"），先命中 look_around 就永远走不到人脸识别。
+    # 假模型抽不出姓名，所以 bind_face 用一个固定名字，只用来验证链路通不通。
+    (("记住我的脸", "绑定我的脸", "绑一下我的脸"), "bind_face", {"name": "测试用户"}),
+    (("谁", "认得", "认识我", "记住我的脸"), "who_is_here", {}),
     (("看", "看见", "前面", "什么", "识别", "这是", "那是什么"), "look_around", {}),
     (("前进", "往前", "向前", "过来", "走"), "move_forward", {"distance_m": 0.3}),
     (("后退", "退后", "往后"), "move_backward", {"distance_m": 0.3}),
@@ -60,6 +65,8 @@ _ACTION_TO_TOOL: dict[str, str] = {
 _FOLLOWUP: dict[str, str] = {
     "show_emotion": "我换了个表情，你看到了吗？",
     "look_around": "我看了一下周围。",
+    "who_is_here": "我看了看面前是谁。",
+    "bind_face": "我把这张脸和名字绑好了。",
     "move_forward": "我往前挪了一点。",
     "move_backward": "我往后退了一点。",
     "turn_left": "我向左转了一下。",
@@ -73,6 +80,8 @@ _FOLLOWUP: dict[str, str] = {
 _STEP_LABEL: dict[str, str] = {
     "show_emotion": "换表情",
     "look_around": "看一眼周围",
+    "who_is_here": "认一下是谁",
+    "bind_face": "记住这张脸",
     "move_forward": "往前走",
     "move_backward": "往后退",
     "turn_left": "向左转",

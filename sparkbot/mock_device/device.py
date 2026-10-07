@@ -30,6 +30,48 @@ logger = logging.getLogger(__name__)
 #: 模拟设备默认声明的能力与硬件参数，与 ``docs/protocol.md`` 的示例一致。
 DEFAULT_CAPABILITIES = ("camera", "microphone", "speaker", "display", "motor")
 
+#: 人脸特征维度，必须与固件的 ``BOT_FACE_FEAT_LEN`` 一致。
+FACE_FEAT_LEN = 512
+
+
+def mock_face_feature(name: str, *, noise: float = 0.0) -> list[float]:
+    """按名字生成一段稳定的 512 维人脸特征（模拟 MFN 模型的输出）。
+
+    两个要点，都是为了**让模拟数据真的能验出问题**：
+    * **同一个名字永远得到同一个向量**（用名字的 sha256 做随机种子），
+      所以"绑一次 → 再扫"应当匹配上，否则说明 PC 侧链路断了；
+    * **默认带一点噪声**：真实摄像头每帧的向量都不一样，如果模拟数据永远
+      精确相等，阈值判断（0.5）那条分支就永远走不到，测了等于没测。
+
+    返回的是 L2 归一化后的 float32 列表 —— 与设备端 esp-dl 的输出一致，
+    也与离线协议里 ``feat_b64``（float32 小端）对得上。
+    """
+    import hashlib
+    import math
+    import random
+
+    seed = int.from_bytes(hashlib.sha256(name.encode("utf-8")).digest()[:8], "big")
+    rng = random.Random(seed)
+    vector = [rng.gauss(0.0, 1.0) for _ in range(FACE_FEAT_LEN)]
+    if noise > 0:
+        jitter = random.Random(seed ^ 0x5EED)
+        vector = [v + jitter.gauss(0.0, noise) for v in vector]
+    norm = math.sqrt(sum(v * v for v in vector)) or 1.0
+    return [v / norm for v in vector]
+
+
+def encode_face_feat(feat: list[float]) -> str:
+    """把特征编码成离线协议约定的 base64（float32 小端）。
+
+    刻意**不**复用 PC 侧的 ``perception.face.encode_feat_b64``：
+    模拟设备是"设备"这一侧的实现，独立按协议写一遍，
+    这样编解码不匹配时才真的会被测出来。
+    """
+    import base64
+    import struct
+
+    return base64.b64encode(struct.pack(f"<{len(feat)}f", *feat)).decode("ascii")
+
 
 @dataclass
 class MockDeviceConfig:
@@ -55,6 +97,12 @@ class MockDeviceConfig:
 
     audio_seconds: float = 1.8
     """每次采集模拟多长的语音。"""
+
+    face_people: list[str] = field(default_factory=list)
+    """模拟「站在摄像头前的人」；每个名字都会被识别成一张稳定的脸。"""
+
+    face_noise: float = 0.03
+    """人脸特征的抖动量，模拟同一个人不同帧之间的差异。"""
 
     stuck_after_s: float = 0.0
     """大于 0 时模拟设备在该秒数后失联（用于测试掉线处理）。"""
@@ -418,6 +466,41 @@ class MockDevice:
         """接受摄像头参数（模拟设备不真正应用）。"""
         return {"camera": {k: v for k, v in params.items()}}
 
+    async def _do_face_identify(self, params: dict[str, Any]) -> dict[str, Any]:
+        """人脸识别（**模拟设备端本地推理**）。
+
+        真实固件是在芯片上跑 esp-dl（检测 + 提特征），只回 512 维特征与框；
+        这里用 :func:`mock_face_feature` 造出同样形状的数据，
+        于是"设备回特征 → PC 认名字"这条链路不需要硬件也能跑通。
+
+        ``config`` 指令可以随时改 ``face_people``，用来模拟"有人走过来/走开"。
+        """
+        people = [str(n) for n in self.config.face_people]
+        faces: list[dict[str, Any]] = []
+        for index, name in enumerate(people[:4]):   # 与固件一样最多 4 张
+            feat = mock_face_feature(name, noise=max(0.0, float(self.config.face_noise)))
+            x1 = 40 + index * 150
+            faces.append(
+                {
+                    "x1": x1,
+                    "y1": 80,
+                    "x2": x1 + 130,
+                    "y2": 260,
+                    "score": 0.93,
+                    "feat_len": len(feat),
+                    "feat_b64": encode_face_feat(feat),
+                }
+            )
+
+        logger.info("🙂 人脸识别（模拟）：%d 张 %s", len(faces), people[:4] or "—")
+        return {
+            "count": len(faces),
+            "width": self.config.frame_width,
+            "height": self.config.frame_height,
+            "feat_format": "float32",
+            "faces": faces,
+        }
+
     async def _capture(self, *, width: int, height: int, quality: int, msg_id: str | None) -> None:
         """渲染并发送一帧。"""
         self._frame_seq += 1
@@ -616,6 +699,14 @@ class MockDevice:
 
     async def _do_config(self, params: dict[str, Any]) -> dict[str, Any]:
         """运行时配置。"""
+        # face_people：模拟"谁走到了摄像头前/谁走开了"，
+        # 这样不用重启模拟设备就能测"换个人会不会认错"。
+        if "face_people" in params:
+            raw = params.get("face_people") or []
+            if isinstance(raw, str):
+                raw = [raw]
+            self.config.face_people = [str(item) for item in raw]
+            logger.info("🙂 模拟场景里的人换成：%s", self.config.face_people or "—")
         return {"applied": {k: v for k, v in params.items()}}
 
     async def _do_reboot(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -701,6 +792,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="遥测上报周期毫秒（默认 3000；调小可让联调更快看到数据）")
     parser.add_argument("--stream-fps", type=float, default=0.0, help="启动即开启推流的帧率")
     parser.add_argument("--audio-seconds", type=float, default=1.8, help="每次采集模拟的语音时长")
+    parser.add_argument("--face", action="append", default=None,
+                        dest="faces",
+                        help="模拟站在摄像头前的人（可重复，最多 4 个）；用于离线验证人脸绑定")
     parser.add_argument("--no-mic", action="store_true", help="不声明麦克风能力")
     parser.add_argument("--no-camera", action="store_true", help="不声明摄像头能力")
     parser.add_argument("--no-display", action="store_true", help="不声明显示屏能力")
@@ -728,6 +822,7 @@ def config_from_args(args: argparse.Namespace) -> MockDeviceConfig:
         trigger_interval_s=args.trigger,
         stream_fps=args.stream_fps,
         audio_seconds=args.audio_seconds,
+        face_people=list(args.faces or []),
         verbose=args.verbose,
     )
 

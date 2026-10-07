@@ -24,6 +24,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #include "bot_hw_i2c.h"
 #include "bot_hw_power.h"
@@ -208,6 +209,32 @@ esp_err_t bot_camera_init(void)
         return err;
     }
 
+    /*
+     * 预热：丢掉前若干帧再返回。
+     *
+     * OV2640 上电后 AEC/AGC/AWB 是从默认值**逐帧收敛**的，头几帧增益拉满、
+     * 白平衡没收敛 —— 直接出图就是"很多噪点 + 彩色横纹"。这条经验来自同板
+     * 的 onegpio 工程：那边实测未收敛帧的逐行噪声是收敛后的 4.5~8 倍。
+     *
+     * 按"时间 + 帧数"双条件等待：收敛是按帧推进的，夜间/低帧率时时间够了
+     * 帧数可能还不够。期间 vTaskDelay 让出 CPU，别把主循环卡住。
+     */
+#define CAM_WARMUP_MS     2000
+#define CAM_WARMUP_FRAMES 20
+    {
+        int64_t deadline = esp_timer_get_time() + (int64_t)CAM_WARMUP_MS * 1000;
+        int discarded = 0;
+        while (discarded < CAM_WARMUP_FRAMES || esp_timer_get_time() < deadline) {
+            camera_fb_t *fb = esp_camera_fb_get();
+            if (fb != NULL) {
+                esp_camera_fb_return(fb);
+            }
+            discarded++;
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        ESP_LOGI(TAG, "预热完成：丢弃 %d 帧（等待 AEC/AGC/AWB 收敛）", discarded);
+    }
+
     /* 板子上的模组装反了，需要水平镜像 */
     sensor_t *sensor = esp_camera_sensor_get();
     if (sensor != NULL) {
@@ -265,6 +292,48 @@ static esp_err_t grab_and_deliver(void)
     s_c.frames_sent++;
     esp_camera_fb_return(fb);
     return err;
+}
+
+/*: 借出去的帧（同一时刻最多一份）。 */
+static camera_fb_t *s_borrowed = NULL;
+
+esp_err_t bot_camera_frame_borrow(const uint8_t **jpeg, size_t *len,
+                                  uint16_t *width, uint16_t *height)
+{
+    if (!s_c.ready || jpeg == NULL || len == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_borrowed != NULL) {
+        return ESP_ERR_INVALID_STATE; /* 上一份还没还 */
+    }
+
+    xSemaphoreTake(s_c.lock, portMAX_DELAY);
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (fb == NULL) {
+        xSemaphoreGive(s_c.lock);
+        ESP_LOGW(TAG, "借帧失败（fb_get 返回 NULL）");
+        return ESP_FAIL;
+    }
+    s_borrowed = fb;
+    *jpeg = fb->buf;
+    *len = fb->len;
+    if (width) {
+        *width = (uint16_t)fb->width;
+    }
+    if (height) {
+        *height = (uint16_t)fb->height;
+    }
+    return ESP_OK;
+}
+
+void bot_camera_frame_release(void)
+{
+    if (s_borrowed == NULL) {
+        return;
+    }
+    esp_camera_fb_return(s_borrowed);
+    s_borrowed = NULL;
+    xSemaphoreGive(s_c.lock);
 }
 
 esp_err_t bot_camera_snapshot(int width, int height, int quality)

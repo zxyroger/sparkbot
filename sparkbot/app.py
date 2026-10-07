@@ -33,7 +33,7 @@ from typing import Any, AsyncIterator
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from . import __version__
 from .config import Settings, get_settings
@@ -930,8 +930,201 @@ def _register_routes(app: FastAPI) -> None:
         return await runtime.test_llm()
 
     # ---------------------------------------------------------------- #
+    # 摄像头
+    # ---------------------------------------------------------------- #
+    #: 每个设备的预览观看者数量。第一个进来时开推流、最后一个走了关掉 ——
+    #: 否则摄像头会一直出流，白占 WiFi 和 CPU（还会发热）。
+    _cam_viewers: dict[str, int] = {}
+
+    @app.get("/api/frame")
+    async def latest_frame(
+        request: Request,
+        device_id: str | None = Query(default=None),
+        fresh: bool = Query(default=False),
+        width: int = Query(default=640),
+        height: int = Query(default=480),
+        quality: int = Query(default=20),
+    ) -> Response:
+        """取一张摄像头画面（JPEG）。
+
+        * 默认返回**最近一张**帧（上次抓图/推流留下的）；
+        * ``fresh=true`` 会先让设备现抓一张再返回（约 0.2~0.3 秒）。
+
+        浏览器直接打开 ``http://127.0.0.1:8765/api/frame?fresh=true`` 就能看图 ——
+        这是验证"摄像头到底有没有出图"最直接的方式，不用去翻日志。
+        """
+        from .device.capabilities import CAP_CAMERA
+
+        runtime = _runtime(request)
+        robot = runtime.robots.try_get(device_id)
+        if robot is None:
+            raise HTTPException(status_code=409, detail="没有在线设备")
+        if not robot.has(CAP_CAMERA):
+            raise HTTPException(status_code=409, detail=f"设备 {robot.device_id} 没有摄像头")
+
+        if fresh:
+            # look() 内部会下发 snapshot、等设备回 frame，并做"声称成功但没回图"的校验
+            result = await robot.look(width=width, height=height, quality=quality)
+            frame = result.frame
+        else:
+            if not robot.conn.frames:
+                raise HTTPException(status_code=404, detail="还没有收到过画面帧（试加 fresh=true）")
+            frame = robot.conn.frames[-1]
+
+        mime = "image/png" if frame.fmt.lower() == "png" else "image/jpeg"
+        return Response(
+            content=frame.data,
+            media_type=mime,
+            headers={
+                "Cache-Control": "no-store",
+                "X-Frame-Width": str(frame.width),
+                "X-Frame-Height": str(frame.height),
+                "X-Frame-Seq": str(frame.seq),
+            },
+        )
+
+    @app.get("/api/frame/mjpeg")
+    async def frame_mjpeg(
+        request: Request,
+        device_id: str | None = Query(default=None),
+        fps: float = Query(default=5.0),
+        width: int = Query(default=640),
+        height: int = Query(default=480),
+    ) -> StreamingResponse:
+        """摄像头**实时预览**（MJPEG 流）。
+
+        浏览器原生支持 ``multipart/x-mixed-replace``：把它塞进 ``<img>`` 的
+        ``src`` 就能连续出画面，前端一行轮询都不用写。
+
+        帧来源是设备的**推流**（``set_stream``）：第一个观看者进来时开推流，
+        最后一个离开时关掉 —— 没人看的时候不让摄像头一直出流。
+        """
+        from .device.capabilities import CAP_CAMERA
+
+        runtime = _runtime(request)
+        robot = runtime.robots.try_get(device_id)
+        if robot is None:
+            raise HTTPException(status_code=409, detail="没有在线设备")
+        if not robot.has(CAP_CAMERA):
+            raise HTTPException(status_code=409, detail=f"设备 {robot.device_id} 没有摄像头")
+
+        fps = max(1.0, min(15.0, float(fps)))
+        key = robot.device_id
+        viewers = _cam_viewers.get(key, 0)
+        _cam_viewers[key] = viewers + 1
+        if viewers == 0:
+            try:
+                await robot.set_stream(enabled=True, fps=fps, width=width, height=height)
+            except Exception:
+                _cam_viewers.pop(key, None)
+                raise
+
+        async def _gen() -> AsyncIterator[bytes]:
+            last_seq = 0
+            try:
+                while True:
+                    # 客户端关掉页面/切走标签页时要能自己退出，否则推流不会停
+                    if await request.is_disconnected():
+                        break
+                    frames = robot.conn.frames
+                    if frames and frames[-1].seq != last_seq:
+                        frame = frames[-1]
+                        last_seq = frame.seq
+                        header = (
+                            "--frame\r\nContent-Type: image/jpeg\r\n"
+                            f"Content-Length: {len(frame.data)}\r\n\r\n"
+                        ).encode()
+                        yield header + frame.data + b"\r\n"
+                    await asyncio.sleep(1.0 / fps)
+            finally:
+                left = _cam_viewers.get(key, 1) - 1
+                if left <= 0:
+                    _cam_viewers.pop(key, None)
+                    # ⚠️ 必须 shield：客户端断开时这个生成器是被**取消**的，
+                    # 取消状态下直接 await 会立刻抛 CancelledError，
+                    # 停推流的命令根本发不出去 —— 摄像头会一直出流（实测）。
+                    with contextlib.suppress(Exception):
+                        await asyncio.shield(robot.set_stream(enabled=False))
+                else:
+                    _cam_viewers[key] = left
+
+        return StreamingResponse(
+            _gen(), media_type="multipart/x-mixed-replace; boundary=frame"
+        )
+
+    # ---------------------------------------------------------------- #
     # 喇叭自检：把"听感"变成可测量的数字
     # ---------------------------------------------------------------- #
+    # ---------------------------------------------------------------- #
+    # 人脸识别：推理在设备端，名字绑在 PC 端
+    # ---------------------------------------------------------------- #
+    # 这几个接口是人脸能力的直接出口，**不经过大模型** ——
+    # 控制台上点一下就能验证"设备到底认不认得出人"，
+    # 不用先让模型绕一圈（模型那圈还要花钱、还可能胡说）。
+
+    def _agent_for(request: Request, device_id: str | None) -> Any:
+        """取目标设备的 Agent；没有在线设备时给 409 而不是 500。"""
+        runtime = _runtime(request)
+        try:
+            return runtime.agents.get(device_id)
+        except DeviceOfflineError as exc:
+            raise HTTPException(status_code=409, detail=exc.message) from exc
+
+    @app.get("/api/faces")
+    async def faces_list(
+        request: Request, device_id: str | None = Query(default=None)
+    ) -> dict[str, Any]:
+        """人脸库里登记了哪些人（只给摘要，不回传特征本身）。"""
+        agent = _agent_for(request, device_id)
+        if agent.face_db is None:
+            raise HTTPException(status_code=409, detail="人脸识别未启用")
+        return {"ok": True, "device_id": agent.device_id, **agent.face_db.snapshot()}
+
+    @app.post("/api/faces/scan")
+    async def faces_scan(
+        request: Request, payload: dict[str, Any] = Body(default={})
+    ) -> dict[str, Any]:
+        """现扫一帧：让设备本地推理，再用 PC 侧人脸库认人。"""
+        agent = _agent_for(request, payload.get("device_id") or None)
+        try:
+            return await agent.scan_faces()
+        except SparkBotError as exc:
+            raise HTTPException(status_code=409, detail=exc.message) from exc
+
+    @app.post("/api/faces/enroll")
+    async def faces_enroll(
+        request: Request, payload: dict[str, Any] = Body(...)
+    ) -> dict[str, Any]:
+        """把当前画面里最大的那张脸绑到指定名字上。
+
+        请求体：``{"name": "王可旭", "device_id": "esp32s3-xx"}``
+        """
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=422, detail="缺少 name")
+        agent = _agent_for(request, payload.get("device_id") or None)
+        try:
+            return await agent.bind_face(name)
+        except SparkBotError as exc:
+            raise HTTPException(status_code=409, detail=exc.message) from exc
+
+    @app.delete("/api/faces/{name}")
+    async def faces_delete(request: Request, name: str) -> dict[str, Any]:
+        """删掉某个人的人脸绑定。"""
+        agent = _agent_for(request, None)
+        if agent.face_db is None:
+            raise HTTPException(status_code=409, detail="人脸识别未启用")
+        removed = agent.face_db.remove(name)
+        return {"ok": True, "removed": removed, "name": name}
+
+    @app.post("/api/faces/clear")
+    async def faces_clear(request: Request) -> dict[str, Any]:
+        """清空整个人脸库（用户行使"删掉我的脸"的权利时用）。"""
+        agent = _agent_for(request, None)
+        if agent.face_db is None:
+            raise HTTPException(status_code=409, detail="人脸识别未启用")
+        return {"ok": True, "cleared": agent.face_db.clear()}
+
     @app.post("/api/debug/speaker_loopback")
     async def speaker_loopback(
         request: Request, payload: dict[str, Any] = Body(default={})
@@ -1115,6 +1308,13 @@ _CONSOLE_HTML = """<!DOCTYPE html>
   button.danger { background: #da3633; border-color: #f85149; }
   .faces { display: flex; flex-wrap: wrap; gap: 6px; }
   .faces button { padding: 5px 9px; font-size: 12px; }
+  /* 摄像头预览：MJPEG 流直接放进 img，保持 4:3 不跳动 */
+  .cam-box { position: relative; width: 100%; aspect-ratio: 4 / 3; background: #0b0e13;
+             border: 1px solid #232a33; border-radius: 8px; overflow: hidden; }
+  .cam-box img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .cam-box .cam-off { position: absolute; inset: 0; display: flex; align-items: center;
+                      justify-content: center; color: #5b6675; font-size: 12px; }
+  .cam-bar { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
   pre { margin: 0; font-size: 12px; white-space: pre-wrap; word-break: break-word;
         font-family: ui-monospace, Consolas, monospace; color: #8b98a5; max-height: 34vh; overflow-y: auto; }
   .events { max-height: 26vh; overflow-y: auto; font-size: 12px;
@@ -1169,6 +1369,30 @@ _CONSOLE_HTML = """<!DOCTYPE html>
     </form>
   </section>
   <aside style="display:flex;flex-direction:column;gap:16px">
+    <section>
+      <h2>摄像头</h2>
+      <div class="cam-box">
+        <img id="cam" alt="摄像头预览">
+        <div class="cam-off" id="camOff">预览未开启</div>
+      </div>
+      <div class="cam-bar">
+        <button type="button" id="camBtn" onclick="toggleCam()">开启预览</button>
+        <span class="hint" id="camHint">设备没有摄像头时无法开启</span>
+      </div>
+    </section>
+    <section>
+      <h2>人脸识别</h2>
+      <p class="hint" style="margin-top:-4px">
+        推理在 ESP32-S3 上本地完成（esp-dl），设备只回特征向量；<b>名字存在 PC 端</b>。
+      </p>
+      <div class="cam-bar">
+        <button type="button" onclick="faceScan()">扫一扫是谁</button>
+        <input type="text" id="face-name" placeholder="姓名" style="max-width:104px">
+        <button type="button" onclick="faceEnroll()">绑定这张脸</button>
+      </div>
+      <div class="faces" id="face-people"></div>
+      <pre id="face-result" style="max-height:16vh">—</pre>
+    </section>
     <section>
       <h2>表情</h2>
       <div class="faces" id="faces"></div>
@@ -1355,6 +1579,37 @@ function buildFaces() {
 }
 
 let statusTick = 0;
+/* 摄像头预览状态。设备没摄像头时按钮直接禁用，避免点了才报错。 */
+let camOn = false;
+let deviceHasCamera = false;
+
+/*
+ * 摄像头预览：浏览器原生支持 multipart/x-mixed-replace，
+ * 把 MJPEG 流直接塞进 <img> 的 src 就能连续出画面，前端不用轮询。
+ * 关掉（或关页面）时浏览器会断开连接，后端据此停掉设备推流。
+ */
+function toggleCam() {
+  const img = document.getElementById("cam");
+  const off = document.getElementById("camOff");
+  const btn = document.getElementById("camBtn");
+  const hint = document.getElementById("camHint");
+  if (!deviceHasCamera) {
+    hint.textContent = "设备没有摄像头（hello 里没报 camera 能力）";
+    return;
+  }
+  camOn = !camOn;
+  if (camOn) {
+    img.src = "api/frame/mjpeg?fps=5&width=640&height=480&t=" + Date.now();
+    off.style.display = "none";
+    btn.textContent = "停止预览";
+    hint.textContent = "推流中；关闭页面会自动停止";
+  } else {
+    img.removeAttribute("src");
+    off.style.display = "flex";
+    btn.textContent = "开启预览";
+    hint.textContent = "已停止";
+  }
+}
 async function refreshStatus() {
   statusTick++;
   const pill = document.getElementById("s-status");
@@ -1377,6 +1632,15 @@ async function refreshStatus() {
     // telemetry 可能是 null（设备刚连上还没上报），用可选链兜住，
     // 否则这里抛异常会让整个 refreshStatus 静默失败。
     const first = (d.devices || [])[0];
+    // 有摄像头才让预览按钮可点（没摄像头时点了只会拿到 409）
+    deviceHasCamera = !!(first && ((first.info || {}).capabilities || []).includes("camera"));
+    const camBtn = document.getElementById("camBtn");
+    if (camBtn) {
+      camBtn.disabled = !deviceHasCamera;
+      if (!deviceHasCamera && camOn) {
+        toggleCam();   // 设备掉线/换板子时自动收起预览（内部会把 camOn 翻回 false）
+      }
+    }
     const telem = first && first.telemetry;
     const batt = telem && telem.battery ? telem.battery.percent : null;
     devPill.innerHTML = first
@@ -1408,7 +1672,75 @@ function connectEvents() {
   ws.onclose = () => setTimeout(connectEvents, 2000);
 }
 
+/* ------------------------------------------------------------------ *
+ * 人脸识别（推理在设备端，名字绑在 PC 端）
+ *
+ * 走 /api/faces* 这几个接口，**不经过大模型** —— 点一下就能知道
+ * "设备到底认不认得出这个人"。绑定成功后名字会跟着人脸库一起
+ * 注入下一轮对话的上下文，模型自然会用名字称呼对方。
+ * ------------------------------------------------------------------ */
+async function faceScan() {
+  const box = document.getElementById("face-result");
+  box.textContent = "识别中…（设备端推理，约 0.5 秒）";
+  try {
+    const res = await fetch("api/faces/scan", {method: "POST",
+      headers: {"Content-Type": "application/json"}, body: "{}"});
+    const data = await res.json();
+    if (!res.ok) { box.textContent = "失败：" + (data.detail || res.status); return; }
+    if (!data.count) { box.textContent = "没有检测到人脸。"; faceRenderPeople(data.people); return; }
+    box.textContent = data.faces.map(f =>
+      `${f.known ? "✅ " + f.name : "❓ 未登记"}  相似度 ${Number(f.similarity).toFixed(3)}` +
+      `  检测分 ${Number(f.score).toFixed(2)}  框 ${f.box.join(",")}`).join("\\n");
+    faceRenderPeople(data.people);
+  } catch (err) { box.textContent = "出错：" + err; }
+}
+
+async function faceEnroll() {
+  const name = (document.getElementById("face-name").value || "").trim();
+  const box = document.getElementById("face-result");
+  if (!name) { box.textContent = "先在输入框里填姓名。"; return; }
+  box.textContent = "绑定中…（请让对方面向摄像头）";
+  try {
+    const res = await fetch("api/faces/enroll", {method: "POST",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify({name})});
+    const data = await res.json();
+    box.textContent = res.ok ? `✅ ${data.name}：${data.samples} 条特征` : "失败：" + (data.detail || res.status);
+    faceRefresh();
+  } catch (err) { box.textContent = "出错：" + err; }
+}
+
+async function faceDelete(name) {
+  await fetch("api/faces/" + encodeURIComponent(name), {method: "DELETE"});
+  faceRefresh();
+}
+
+function faceRenderPeople(people) {
+  const box = document.getElementById("face-people");
+  if (!box) return;
+  box.innerHTML = "";
+  if (!people || !people.count) {
+    box.innerHTML = '<span class="hint">人脸库还是空的（扫一次 + 填名字绑定）</span>';
+    return;
+  }
+  people.people.forEach(p => {
+    const b = document.createElement("button");
+    b.textContent = `${p.name}（${p.samples}）`;
+    b.title = "点击删除这个人的人脸绑定";
+    b.onclick = () => faceDelete(p.name);
+    box.appendChild(b);
+  });
+}
+
+async function faceRefresh() {
+  try {
+    const res = await fetch("api/faces");
+    if (!res.ok) return;   // 没人脸能力时静默，不打扰对话面板
+    faceRenderPeople(await res.json());
+  } catch (err) { /* 状态轮询本来就会报错，这里不重复打扰 */ }
+}
+
 buildFaces();
+faceRefresh();
 refreshStatus();
 connectEvents();
 setInterval(refreshStatus, 5000);

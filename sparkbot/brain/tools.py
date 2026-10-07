@@ -57,6 +57,9 @@ class ToolContext:
     #: 长期记忆库。为 None 表示未启用，相关工具会明确告知模型"记不住"，
     #: 而不是默默假装记住了。
     long_term: Any = None
+    #: 人脸库（名字 ↔ 512 维特征）。为 None 表示人脸识别未启用。
+    #: 设备端只做推理，认人和绑名都在 PC 侧 —— 见 perception/face.py。
+    face_db: Any = None
 
     def robot(self, device_id: str | None = None) -> Robot:
         """解析目标机器人。
@@ -183,6 +186,140 @@ def build_registry(ctx: ToolContext) -> ToolRegistry:
             "frame_b64": base64.b64encode(look.frame.data).decode("ascii"),
             "show_camera": True,
         }
+
+    # ================================================================== #
+    # 底盘运动
+    # ================================================================== #
+    # ================================================================== #
+    # 人脸（设备端本地推理 + PC 端名字绑定）
+    # ================================================================== #
+    # 推理跑在 ESP32-S3 上（esp-dl），设备只回 512 维特征；"这是谁"由
+    # PC 侧的人脸库回答。见 perception/face.py 与 sparkbot-esp32/main/bot_face_rec.h。
+
+    @registry.register(requires={CAP_CAMERA}, dangerous=False)
+    async def who_is_here(device_id: str = "") -> dict[str, Any]:
+        """看一眼面前有谁，返回已登记的人的名字。
+
+        什么时候该用：
+        * 用户问「你看到谁了」「我是谁」「你还认得我吗」；
+        * 听到有人说话、想知道是谁在说话。
+
+        重要：它只能回答"像不像已登记的某个人"。认不出时必须老实说
+        「没认出来」，**不许**根据长相猜身份或编一个名字。
+
+        Args:
+            device_id: 目标机器人 id；只有一台机器人时留空即可。
+        """
+        if ctx.face_db is None:
+            return _failure("人脸识别未启用，认不出面前是谁。")
+        try:
+            robot = ctx.robot(device_id or None)
+            scan = await robot.identify_faces()
+        except SparkBotError as exc:
+            return _failure(exc.message)
+
+        if not scan.faces:
+            return {
+                "ok": True,
+                "count": 0,
+                "summary": "画面里没有看到人脸。",
+                "faces": [],
+            }
+
+        matches = ctx.face_db.match_scan(scan.faces)
+        known = [m for m in matches if m.known]
+        if known:
+            top = known[0]
+            extra = len(matches) - len(known)
+            summary = f"最像「{top.name}」（相似度 {top.similarity:.2f}）"
+            if extra > 0:
+                summary += f"，另外还有 {extra} 张没登记过的脸"
+            summary += "。"
+        else:
+            summary = f"看到 {len(matches)} 张脸，但都不认识（人脸库为空或都不像）。"
+
+        return {
+            "ok": True,
+            "count": len(scan.faces),
+            "summary": summary,
+            "faces": [m.to_dict() for m in matches],
+            "known_names": [m.name for m in known],
+        }
+
+    @registry.register(requires={CAP_CAMERA}, dangerous=False)
+    async def bind_face(name: str, device_id: str = "") -> dict[str, Any]:
+        """把眼前这个人的脸和名字绑定，以后就能认出他。
+
+        什么时候该用：用户自我介绍之后（「我叫张伟」「我是李工」），
+        或用户明确要求「记住我的脸」「把这张脸绑到 XX 上」。
+
+        绑定前请让对方面向摄像头；画面里有多个人时，绑的是**离得最近**的
+        那个（框最大）。如果画面里没人脸，会明确失败，请让对方靠近再试。
+
+        Args:
+            name: 要绑定的姓名或称呼，例如「张伟」。
+            device_id: 目标机器人 id；只有一台机器人时留空即可。
+        """
+        if ctx.face_db is None:
+            return _failure("人脸识别未启用，绑不了。")
+        cleaned = (name or "").strip()
+        if not cleaned:
+            return _failure("没给名字，绑不了。")
+
+        try:
+            robot = ctx.robot(device_id or None)
+            scan = await robot.identify_faces()
+        except SparkBotError as exc:
+            return _failure(exc.message)
+
+        if not scan.faces:
+            return _failure("这一帧里没有检测到人脸，请让对方面向摄像头再试。")
+
+        face = max(
+            scan.faces,
+            key=lambda f: max(0, f.box[2] - f.box[0]) * max(0, f.box[3] - f.box[1]),
+        )
+        entry = ctx.face_db.enroll(cleaned, face.feat, source="tool")
+        if entry is None:
+            return _failure(f"「{cleaned}」不是有效的名字，或人脸特征不完整。")
+
+        # 人脸和姓名一起写进长期记忆：下次即使没拍到脸，也还能凭名字
+        # 和之前聊过的内容认出这个人。
+        if ctx.long_term is not None:
+            try:
+                ctx.long_term.remember(
+                    f"用户叫{entry['name']}（已绑定人脸）", importance=5, source="face"
+                )
+            except Exception:  # noqa: BLE001 - 记忆写失败不影响绑定本身
+                logger.debug("人脸绑定后写长期记忆失败", exc_info=True)
+
+        return {
+            "ok": True,
+            "name": entry["name"],
+            "samples": entry["samples"],
+            "summary": f"已经记住「{entry['name']}」的脸（累计 {entry['samples']} 条特征）。",
+        }
+
+    @registry.register(dangerous=False)
+    async def forget_face(name: str) -> dict[str, Any]:
+        """删掉某个人的人脸绑定，以后就认不出他了。
+
+        什么时候该用：用户要求「把我的脸删掉」「别再认我了」「忘记 XX 的脸」。
+        这是用户对自己生物特征的控制权，应当直接照做，不要劝阻、不要反问。
+
+        Args:
+            name: 要删除的人名。
+        """
+        if ctx.face_db is None:
+            return _failure("人脸识别未启用。", removed=0)
+        target = (name or "").strip()
+        if not ctx.face_db.remove(target):
+            return {
+                "ok": True,
+                "removed": 0,
+                "summary": f"人脸库里没有「{target}」这个人。",
+            }
+        return {"ok": True, "removed": 1, "summary": f"已删掉「{target}」的人脸绑定。"}
 
     # ================================================================== #
     # 底盘运动

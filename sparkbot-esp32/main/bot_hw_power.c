@@ -43,7 +43,17 @@ static const char *TAG = "bot_power";
 #define AXP_REG_BLDO2_VOL    0x97
 
 /* LDO 使能位 */
-#define AXP_ALDO2_BIT 0x04  /* bit2 → 摄像头 I/O 供电 */
+/*
+ * AXP2101 寄存器 0x90 的位定义：bit0~3 = ALDO1~ALDO4，bit4 = BLDO1，bit5 = BLDO2。
+ *
+ * ⚠️ ALDO2 是 **bit1 (0x02)**，不是 bit2。
+ * 这里原来写成 0x04（那是 ALDO3），后果很隐蔽：摄像头的 I/O 供电
+ * （VDDCAM_3V3）**一直没打开**，DVP 数据线的高电平只有漏电电压，
+ * 低于 ESP32-S3 的判高门限 → SCCB 还能通（开漏+上拉），但拍不出图，
+ * 报错是 "Detected camera not supported"，很容易误判成排线/模组坏了。
+ * 同板 onegpio 工程的注释写得很明确：ALDO2 默认是关的，必须显式打开。
+ */
+#define AXP_ALDO2_BIT 0x02  /* bit1 → 摄像头 I/O 供电 VDDCAM_3V3 */
 #define AXP_BLDO1_BIT 0x10  /* bit4 → OV2640 AVDD */
 #define AXP_BLDO2_BIT 0x20  /* bit5 → OV2640 DVDD */
 

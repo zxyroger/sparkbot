@@ -29,6 +29,23 @@ dependencies:
       registry_url: https://components.espressif.com
       type: service
     version: 0.7.0
+  espressif/esp-dl:
+    component_hash: 8077cda03ac2d892733611ece7c6c1cbac8bcc99eb4f4cf9d46c957afd02e6fb
+    dependencies:
+    - name: espressif/esp_jpeg
+      registry_url: https://components.espressif.com
+      require: private
+      version: ^1.0.5~3
+    - name: idf
+      require: private
+      version: '>=5.3'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32s3
+    - esp32p4
+    version: 3.1.0
   espressif/esp-dsp:
     component_hash: 12e44db246517a627bc0fe2b255b8335410c0215c98bfba2df5a8e3edea839ef
     dependencies:
@@ -109,16 +126,41 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.2.0
+  espressif/human_face_detect:
+    component_hash: e9f5c61db2f921036b05de64357c10516cd6cd120ed69cdb781dfcc5962e089e
+    dependencies:
+    - name: espressif/esp-dl
+      registry_url: https://components.espressif.com
+      require: private
+      version: 3.1.0
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.2.0
+  espressif/human_face_recognition:
+    component_hash: 87cddd3e8728deb7fd94bd913b0f7c205cc50e901633750c4a194e9d13f45fce
+    dependencies:
+    - name: espressif/human_face_detect
+      registry_url: https://components.espressif.com
+      require: private
+      version: ^0.2.0
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.2.0
   idf:
     source:
       type: idf
     version: 5.5.4
 direct_dependencies:
+- espressif/esp-dl
 - espressif/esp-sr
 - espressif/esp32-camera
 - espressif/esp_codec_dev
 - espressif/esp_lcd_ili9341
+- espressif/human_face_detect
+- espressif/human_face_recognition
 - idf
-manifest_hash: d00c5859f1976ce96050c108050a5ae9f4849b1646a39b444cc6dcbfc7201160
+manifest_hash: 2bf384049178024619f0f5571b3030790a7157ce1d20b732ba58591fbbc82577
 target: esp32s3
 version: 2.0.0

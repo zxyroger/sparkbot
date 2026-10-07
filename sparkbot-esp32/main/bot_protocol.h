@@ -88,6 +88,9 @@ extern "C" {
 #define BOT_ACT_SNAPSHOT            "snapshot"
 #define BOT_ACT_SET_STREAM          "set_stream"
 #define BOT_ACT_SET_CAMERA_PARAMS   "set_camera_params"
+/* 人脸识别（**本地推理**）：设备抓一帧 → esp-dl 检测+提特征 →
+ * 只把 512 维特征（int8, base64）和框回给 PC，姓名由 PC 绑定。 */
+#define BOT_ACT_FACE_IDENTIFY       "face_identify"
 /* 音频 */
 #define BOT_ACT_PLAY_AUDIO          "play_audio"
 /* 流式播放三件套：begin → write × N → end。

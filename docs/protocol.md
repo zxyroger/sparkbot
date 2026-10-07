@@ -209,6 +209,29 @@ PC 侧的唯一事实来源是 `sparkbot/device/protocol.py`，两者必须保�
 | `snapshot` | `width`, `height`, `quality`, `format` | 抓一帧，以 `frame` 消息回传 |
 | `set_stream` | `enabled`, `fps`, `width`, `height` | 连续推流（调试/监控用） |
 | `set_camera_params` | 实现自定义 | 亮度、曝光等 |
+| `face_identify` | `{}` | **设备端本地推理**：抓一帧 → 人脸检测 + 提特征，只回特征向量 |
+
+#### `face_identify` 的返回（本地推理，上传识别信息）
+
+设备侧跑模型（固件用 esp-dl：MSR+MNP 检测、MFN 提特征），
+**不上传图片**，只回特征与框：
+
+```json
+{"ok": true,
+ "data": {"count": 1, "width": 640, "height": 480, "feat_format": "float32",
+          "faces": [{"x1": 210, "y1": 96, "x2": 340, "y2": 270,
+                     "score": 0.91, "feat_len": 512,
+                     "feat_b64": "<2048 字节 float32 小端，base64>"}]}}
+```
+
+约定（PC 侧 ``sparkbot/perception/face.py`` 按这个实现，改一处就要改两处）：
+
+* `feat_b64` 是 **float32 小端**、长度 `feat_len` 的原始字节，不是文本数组；
+* 特征已由模型做 **L2 归一化**，所以两边**点积即余弦相似度**，
+  阈值沿用 esp-dl `HumanFaceRecognizer` 的默认值 `0.5`；
+* 一帧最多回 4 张脸；没检测到脸时 `count=0`、`faces=[]`（不是错误）；
+* **「这是谁」不在这条协议里** —— 设备不认识名字，名字留在 PC 侧的人脸库；
+* 整条消息约 11KB（4 张脸），远小于单条文本帧上限。
 
 ### 3.4 音频
 

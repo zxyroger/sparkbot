@@ -283,12 +283,19 @@ menu "SparkBot 固件配置"
 
         config SPARKBOT_CAMERA_XCLK_FREQ_HZ
             int "XCLK 频率 (Hz)"
-            default 20000000
+            default 24000000
+            help
+                **必须是 24MHz**。OV2640 的寄存器表是按 24MHz 调的；同板
+                onegpio 工程实测 20MHz/10MHz 下画面全是噪点，连 JPEG 头里的
+                DHT/SOF 标记字节都会被采错（C4→C5 / C0→C1），一半的帧无法解码。
 
         config SPARKBOT_CAMERA_JPEG_QUALITY
             int "默认 JPEG 质量 (0~63，越小越清晰)"
             range 0 63
-            default 12
+            default 20
+            help
+                VGA 下质量 12 时一帧可到 100KB，容易顶满帧缓冲被整体丢弃
+                （FB-OVF）。配合 100KB 的 JPEG 帧缓冲取 20 更稳（oneg pio 实测）。
 
         config SPARKBOT_CAMERA_FB_COUNT
             int "帧缓冲个数"

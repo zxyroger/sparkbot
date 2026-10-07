@@ -154,6 +154,9 @@ class Action(str, Enum):
     SNAPSHOT = "snapshot"  # 抓一帧，回 frame 消息
     SET_STREAM = "set_stream"  # 启停连续推流 fps/分辨率
     SET_CAMERA_PARAMS = "set_camera_params"
+    #: 人脸识别（设备侧**本地推理**）：抓一帧 → esp-dl 检测 + 提特征，
+    #: 只回特征向量与人脸框；"这是谁"由 PC 侧的人脸库回答（见 perception/face.py）。
+    FACE_IDENTIFY = "face_identify"
 
     # --- 音频 ---
     PLAY_AUDIO = "play_audio"  # 播放 PC 侧生成的音频（url 或内联 base64）

@@ -24,6 +24,7 @@
 
 #include "bot_hw_audio.h"
 #include "bot_hw_camera.h"
+#include "bot_face_rec.h"
 #include "bot_hw_display.h"
 #include "bot_hw_motor.h"
 #include "bot_hw_power.h"
@@ -727,6 +728,86 @@ static cJSON *exec_action(const char *action, const cJSON *params,
         cJSON_AddNumberToObject(d, "width", aw);
         cJSON_AddNumberToObject(d, "height", ah);
         cJSON_AddNumberToObject(d, "quality", aq);
+        return d;
+    }
+
+    /*
+     * 人脸识别（本地推理）：抓一帧 → esp-dl 检测 + 提特征 → 只回特征与框。
+     * 名字的绑定在 PC 侧（Agent 才知道这人叫什么、之前聊过什么）。
+     */
+    if (strcmp(action, BOT_ACT_FACE_IDENTIFY) == 0) {
+        if (!bot_camera_ready()) {
+            if (want_reply) {
+                REPLY_ERR(BOT_ERR_HARDWARE_FAULT, "本机未启用摄像头");
+            }
+            return NULL;
+        }
+        if (!bot_face_rec_ready()) {
+            if (want_reply) {
+                REPLY_ERR(BOT_ERR_HARDWARE_FAULT, "人脸模型未就绪");
+            }
+            return NULL;
+        }
+
+        const uint8_t *jpeg = NULL;
+        size_t jlen = 0;
+        uint16_t fw = 0, fh = 0;
+        if (bot_camera_frame_borrow(&jpeg, &jlen, &fw, &fh) != ESP_OK) {
+            if (want_reply) {
+                REPLY_ERR(BOT_ERR_HARDWARE_FAULT, "抓帧失败");
+            }
+            return NULL;
+        }
+
+        static bot_face_t faces[BOT_FACE_MAX];
+        int n = bot_face_rec_run(jpeg, jlen, faces, BOT_FACE_MAX);
+        bot_camera_frame_release();
+
+        if (n < 0) {
+            if (want_reply) {
+                REPLY_ERR(BOT_ERR_INTERNAL, "人脸推理失败");
+            }
+            return NULL;
+        }
+
+        cJSON *d = cJSON_CreateObject();
+        cJSON_AddNumberToObject(d, "count", n);
+        cJSON_AddNumberToObject(d, "width", fw);
+        cJSON_AddNumberToObject(d, "height", fh);
+        /* 特征是 float32 且已 L2 归一化 —— PC 侧点积即为余弦相似度。 */
+        cJSON_AddStringToObject(d, "feat_format", "float32");
+        cJSON *arr = cJSON_CreateArray();
+        for (int i = 0; i < n; i++) {
+            cJSON *o = cJSON_CreateObject();
+            cJSON_AddNumberToObject(o, "x1", faces[i].x1);
+            cJSON_AddNumberToObject(o, "y1", faces[i].y1);
+            cJSON_AddNumberToObject(o, "x2", faces[i].x2);
+            cJSON_AddNumberToObject(o, "y2", faces[i].y2);
+            cJSON_AddNumberToObject(o, "score", faces[i].score);
+            cJSON_AddNumberToObject(o, "feat_len", faces[i].feat_len);
+
+            /* 512 维 float32 = 2048 字节 → base64 后 2731 字符，
+             * 4 张脸约 11KB，远小于单条 WebSocket 消息上限（512KB）。
+             * 不做压缩：特征本来就是模型输出的原值，PC 侧零解码成本。 */
+            size_t need = 0;
+            if (mbedtls_base64_encode(NULL, 0, &need,
+                                      (const unsigned char *)faces[i].feat,
+                                      (size_t)faces[i].feat_len * sizeof(float)) == 0) {
+                char *b64 = malloc(need + 1);
+                if (b64 != NULL) {
+                    size_t out_len = 0;
+                    if (mbedtls_base64_encode((unsigned char *)b64, need + 1, &out_len,
+                                              (const unsigned char *)faces[i].feat,
+                                              (size_t)faces[i].feat_len * sizeof(float)) == 0) {
+                        b64[out_len] = '\0';
+                        cJSON_AddStringToObject(o, "feat_b64", b64);
+                    }
+                    free(b64);
+                }
+            }
+            cJSON_AddItemToArray(arr, o);
+        }
+        cJSON_AddItemToObject(d, "faces", arr);
         return d;
     }
 

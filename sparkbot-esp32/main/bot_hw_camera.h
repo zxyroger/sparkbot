@@ -63,6 +63,19 @@ void bot_camera_get_info(uint16_t *width, uint16_t *height, int *quality);
 /* 主循环定期调用：推流时按 fps 抓帧 */
 void bot_camera_poll(void);
 
+/*
+ * 借一帧原始 JPEG —— 给**本地人脸推理**用（见 bot_face_rec.h）。
+ *
+ * 与 snapshot 的区别：snapshot 是"抓完就通过回调发出去"，这里只是把
+ * 帧借给调用方用一下（推理完就还），不发网络。
+ *
+ * 用完**必须**调 bot_camera_frame_release()，否则帧缓冲会被占满，
+ * 之后抓帧会一直失败。
+ */
+esp_err_t bot_camera_frame_borrow(const uint8_t **jpeg, size_t *len,
+                                  uint16_t *width, uint16_t *height);
+void bot_camera_frame_release(void);
+
 #ifdef __cplusplus
 }
 #endif

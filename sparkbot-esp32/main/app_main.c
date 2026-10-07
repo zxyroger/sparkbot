@@ -35,6 +35,7 @@
 #include "bot_engine.h"
 #include "bot_hw_audio.h"
 #include "bot_hw_camera.h"
+#include "bot_face_rec.h"
 #include "bot_hw_display.h"
 #include "bot_hw_i2c.h"
 #include "bot_hw_motor.h"
@@ -162,17 +163,28 @@ static void init_hardware(void)
         ESP_LOGW(TAG, "电源管理初始化失败");
     }
 
-    /* 5. 摄像头 */
-    bot_camera_set_frame_cb(on_camera_frame);
+    /* 5. 摄像头
+     *
+     * ⚠️ 回调必须在 bot_camera_init() **之后**注册：
+     * bot_camera_init() 第一句是 memset(&s_c, 0, sizeof(s_c))，
+     * 先注册会被当场清成 NULL。现象是抓帧成功但没人收 ——
+     * 串口打 "没有注册帧回调，帧被丢弃"，PC 侧一张图都拿不到。
+     * （和音频 audio_done 回调踩过的是同一个坑。） */
     if (bot_camera_init() != ESP_OK) {
         ESP_LOGW(TAG, "摄像头不可用（其它功能继续）");
     }
+    bot_camera_set_frame_cb(on_camera_frame);
+
+    /* 注意：人脸模型不在这里加载 —— 见 app_main() 里"先起网络再加载模型"的说明。
+     * esp-dl 的推理缓冲最多要 840KB 内部 RAM，必须在 WiFi 把它的缓冲区
+     * 拿走之后再加载，否则 WiFi 会因为拿不到内部 RAM 而 init 失败并重启。 */
 
     /* 6. 电机（最后：确保前面出问题时轮子始终是停的） */
-    bot_motor_set_done_cb(on_motion_done);
     if (bot_motor_init() != ESP_OK) {
         ESP_LOGW(TAG, "电机初始化失败");
     }
+    /* 同上：bot_motor_init() 也会 memset，回调必须放在它之后。 */
+    bot_motor_set_done_cb(on_motion_done);
 }
 
 /* 把各模块的能力汇总成一行日志，便于一眼确认板子状态 */
@@ -378,6 +390,25 @@ void app_main(void)
 
     if (bot_proto_init() != ESP_OK) {
         ESP_LOGE(TAG, "协议引擎初始化失败");
+    }
+
+    /*
+     * 人脸检测/识别模型（esp-dl，本地推理）**必须放在网络起来之后**加载。
+     *
+     * 原因：esp-dl 的推理缓冲最多要 840KB（实测 MemoryManagerGreedy:
+     * Maximum memory size: 840448），而 ESP32-S3 只有 512KB 内部 RAM，
+     * WiFi 协议栈自己也要一大块内部 RAM。之前把模型放在网络之前加载，
+     * 结果 WiFi 初始化时 malloc 失败：
+     *     W wifi:malloc buffer fail / E esp_wifi_init → ESP_ERR_NO_MEM
+     *     abort() → 设备无限重启。
+     *
+     * 放在网络之后：WiFi 先拿到它需要的内部 RAM，esp-dl 再按"剩余可用量"
+     * 自己收窄（超出部分用 PSRAM），两边都能起来。
+     */
+    if (bot_camera_ready()) {
+        if (bot_face_rec_init() != 0) {
+            ESP_LOGW(TAG, "人脸模型加载失败（摄像头与其它功能仍可用）");
+        }
     }
 
     ESP_LOGI(TAG, "目标服务端: %s:%u%s", bot_net_server_host(), bot_net_server_port(),

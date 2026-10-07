@@ -27,10 +27,18 @@ from ..config import Settings
 from ..core.errors import DeviceOfflineError, ProviderError, SparkBotError
 from ..core.events import EventBus
 from ..core.tools import ToolRegistry, ToolResult
-from ..device.capabilities import CAP_DISPLAY, CAP_MOTOR, CAP_SPEAKER, Robot, RobotProvider
+from ..device.capabilities import (
+    CAP_CAMERA,
+    CAP_DISPLAY,
+    CAP_MOTOR,
+    CAP_SPEAKER,
+    Robot,
+    RobotProvider,
+)
 from ..device.protocol import Emotion
 from ..llm.base import ChatMessage, LLMProvider, LLMResponse, ToolCallRequest, Usage
 from ..paths import vendor_dir
+from ..perception.face import FaceDB, FaceMatch, FaceScan, get_face_db
 from .long_term import LongTermMemory, get_memory
 from .memory import Memory
 from .tools import ToolContext
@@ -50,6 +58,61 @@ def memory_path(settings: Settings) -> Path:
         return raw
     # paths.vendor_dir() = <项目根>/.vendor
     return vendor_dir().parent / raw
+
+
+def face_db_path(settings: Settings) -> Path:
+    """解析人脸库文件路径；相对路径的基准与长期记忆一致（项目根目录）。"""
+    raw = Path(settings.face.path)
+    if raw.is_absolute():
+        return raw
+    return vendor_dir().parent / raw
+
+
+def extract_self_name(text: str) -> str | None:
+    """从用户话语里抽出他**自报的姓名**，抽不到返回 ``None``。
+
+    只认"我叫…""我是…""叫我…""我的名字是…"这几种明确的自我介绍句式。
+    为什么不复用 ``_MEMORY_PATTERNS`` 里的身份规则：那条规则会把
+    "我是学生""我是工程师"里的**职业**也当成名字记下来 —— 用于写一条
+    长期记忆无伤大雅，但拿去绑人脸就会把张三的脸挂到"学生"这个名字上。
+    所以这里额外加了一道"像不像名字"的过滤。
+    """
+    haystack = (text or "").strip()
+    if not haystack or len(haystack) > 60:
+        return None
+    for pattern in _SELF_NAME_PATTERNS:
+        m = pattern.search(haystack)
+        if not m:
+            continue
+        name = m.group(1).strip(" 　.·、,，")
+        # 中文姓名 2~4 字；英文名允许带空格与点（"Li Ming"、"J. Smith"）。
+        if not name:
+            continue
+        if name in _NOT_A_NAME:
+            logger.debug("「%s」看着不像名字，跳过人脸绑定", name)
+            continue
+        return name
+    return None
+
+
+#: 自我介绍句式 → 姓名（按"明确程度"排序，先匹配到的算数）。
+_SELF_NAME_PATTERNS = [
+    re.compile(r"我(?:的名字)?(?:叫|是)\s*([\u4e00-\u9fff]{2,4})"),
+    re.compile(r"(?:我的)?名字(?:是|叫)\s*([\u4e00-\u9fff]{2,4})"),
+    re.compile(r"叫我\s*([\u4e00-\u9fff]{2,4})"),
+    re.compile(r"我(?:的名字)?(?:叫|是)\s*([A-Za-z][A-Za-z .'\-]{0,20})"),
+    re.compile(r"(?:我的)?名字(?:是|叫)\s*([A-Za-z][A-Za-z .'\-]{0,20})"),
+    re.compile(r"叫我\s*([A-Za-z][A-Za-z .'\-]{0,20})"),
+]
+
+#: 自我介绍句式里常见、但**不是名字**的词。
+#: 不拦的话 "我是学生" 会把一张脸绑到"学生"上，之后所有学生都被叫"学生"。
+_NOT_A_NAME = frozenset(
+    """
+    学生 老师 工程师 程序员 医生 司机 老板 大人 机器人 助理 记者 律师
+    护士 警察 同事 朋友 新人 新来的 一个 好人 坏人 小孩子 大人
+    """.split()
+)
 
 
 #: 自动记忆的抽取规则：(正则, 重要度)。
@@ -110,6 +173,9 @@ class AgentTurn:
     rounds: int = 0
     duration_ms: int = 0
     error: str | None = None
+    #: 本轮开始前扫到的人脸匹配结果（见 :meth:`Agent._look_at_faces`）。
+    #: 空列表表示没扫到脸、或人脸能力没启用。
+    faces: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -129,6 +195,7 @@ class AgentTurn:
             "rounds": self.rounds,
             "duration_ms": self.duration_ms,
             "error": self.error,
+            "faces": self.faces,
         }
 
 
@@ -271,6 +338,23 @@ class Agent:
         # ctx 可能为 None（纯聊天场景；测试里就常传 None），所以要判空。
         if self.ctx is not None:
             self.ctx.long_term = self.long_term
+
+        # 人脸库：名字 ↔ 512 维人脸特征。**推理在设备上做，名字留在 PC 侧** ——
+        # 设备只回特征向量，认人和绑名都在这里（见 perception/face.py）。
+        # 同样取单例，配置热更新重建 Agent 时不会把已绑定的名字弄丢。
+        self.face_db: FaceDB | None = None
+        if settings.face.enabled:
+            try:
+                self.face_db = get_face_db(
+                    face_db_path(settings),
+                    threshold=settings.face.threshold,
+                    max_samples=settings.face.max_samples,
+                    enabled=True,
+                )
+            except Exception:  # noqa: BLE001 - 人脸库坏了不该让机器人起不来
+                logger.exception("人脸库初始化失败，将以无人脸识别模式运行")
+        if self.ctx is not None:
+            self.ctx.face_db = self.face_db
         self._lock = asyncio.Lock()
         """串行化同一台机器人的对话，避免两轮对话抢同一个底盘。"""
 
@@ -415,8 +499,212 @@ class Agent:
             self._base_system_prompt()
             + self._device_context()
             + self._memory_context(query)
+            + self._face_context()
         )
         return messages
+
+    # ------------------------------------------------------------------ #
+    # 人脸：认人 + 绑名
+    # ------------------------------------------------------------------ #
+    def _face_context(self) -> str:
+        """把"现在面前是谁"渲染成提示词片段（本轮扫脸的结果，见 _look_at_faces）。"""
+        hint = getattr(self, "_face_hint", "")
+        if not hint:
+            return ""
+        return (
+            "\n人脸识别（设备端本地推理，可能出错；拿不准就用自然语言确认一下）：\n"
+            f"{hint}\n"
+        )
+
+    async def _look_at_faces(self) -> tuple[FaceScan | None, str]:
+        """扫一帧人脸并匹配姓名，返回 ``(扫描结果, 注入提示词)``。
+
+        为什么每轮都扫：用户是站在机器人面前的，认不出说话的人是谁，
+        "自动绑定姓名"就无从谈起。代价是设备端一次推理约 0.4~0.8 秒，
+        所以给了 ``face.auto_scan`` 开关。
+
+        任何一步失败都只记日志、返回空提示 —— 人脸是锦上添花的能力，
+        不能因为它坏了就让对话进行不下去。
+        """
+        self._face_hint = ""
+        self._face_matches: list[FaceMatch] = []
+        if self.face_db is None or not self.settings.face.enabled:
+            return None, ""
+        if not self.settings.face.auto_scan:
+            return None, ""
+
+        try:
+            robot = self.robots.get(self.device_id)
+        except DeviceOfflineError:
+            return None, ""
+        if not robot.has(CAP_CAMERA):
+            return None, ""
+
+        try:
+            scan = await robot.identify_faces()
+        except SparkBotError as exc:
+            logger.info("人脸扫描跳过（%s）", exc.message)
+            return None, ""
+        except Exception as exc:  # noqa: BLE001 - 感知失败不该影响对话
+            logger.debug("人脸扫描异常: %s", exc, exc_info=True)
+            return None, ""
+
+        if not scan.faces:
+            return scan, "摄像头里没有检测到人脸。"
+
+        try:
+            matches = self.face_db.match_scan(scan.faces)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("人脸匹配失败: %s", exc, exc_info=True)
+            return scan, ""
+
+        hint = self._render_face_hint(matches)
+        self._face_hint = hint
+        self._face_matches = matches
+        logger.info(
+            "人脸扫描: %d 张脸 → %s",
+            len(scan.faces),
+            "、".join(
+                f"{m.name or '未登记'}({m.similarity:.2f})" for m in matches
+            ),
+        )
+        self.bus.publish(
+            "face.scanned",
+            device_id=self.device_id,
+            faces=[m.to_dict() for m in matches],
+        )
+        return scan, hint
+
+    def _render_face_hint(self, matches: list[FaceMatch]) -> str:
+        """把匹配结果写成一句模型能直接用的中文。"""
+        known = [m for m in matches if m.known]
+        if not known:
+            return (
+                f"摄像头里看到 {len(matches)} 张脸，但都不在已登记的人脸库里。"
+                "不要瞎猜对方是谁；可以请他做个自我介绍，"
+                "确认姓名后再调用 bind_face 把这张脸绑上去。"
+            )
+
+        limit = max(1, int(self.settings.face.max_injected))
+        parts = [f"「{m.name}」（相似度 {m.similarity:.2f}）" for m in known[:limit]]
+        unknown = len(matches) - len(known)
+        tail = f"；另外还有 {unknown} 张没登记过的脸" if unknown > 0 else ""
+        return (
+            f"现在站在你面前的最像：{'、'.join(parts)}{tail}。"
+            "可以直接用名字称呼对方，但别把不认识的人认成他。"
+        )
+
+    async def scan_faces(self, *, include_feature: bool = False) -> dict[str, Any]:
+        """主动扫一次脸并返回结构化结果（给控制台/接口用，不经过模型）。"""
+        try:
+            robot = self.robots.get(self.device_id)
+        except DeviceOfflineError as exc:
+            raise SparkBotError(exc.message) from exc
+        if self.face_db is None or not self.settings.face.enabled:
+            raise SparkBotError("人脸识别未启用")
+
+        scan = await robot.identify_faces()
+        # 逐张脸匹配后排序。刻意**不**复用 match_scan()：那个方法会丢掉
+        # "哪张脸对应哪条结果"的配对关系（它按相似度重排），而控制台要画框，
+        # 必须让每条结果带着自己那张脸的检测分数。
+        rows: list[dict[str, Any]] = []
+        for face in scan.faces:
+            m = self.face_db.match(face.feat)
+            rows.append(
+                {
+                    "name": m.name,
+                    "similarity": round(m.similarity, 4),
+                    "known": m.known,
+                    "box": list(face.box),
+                    "score": round(float(face.score), 4),
+                }
+            )
+        rows.sort(key=lambda r: r["similarity"], reverse=True)
+        return {
+            "ok": True,
+            "device_id": robot.device_id,
+            "count": len(scan.faces),
+            "width": scan.width,
+            "height": scan.height,
+            "faces": rows,
+            "people": self.face_db.snapshot(),
+        }
+
+    async def bind_face(self, name: str, *, role: str = "user") -> dict[str, Any]:
+        """把当前画面里**最大的那张脸**绑到指定名字上。
+
+        为什么取"最大"：离摄像头最近的人通常就是正在说话的人。设备端的
+        ``HumanFaceRecognizer`` 在多张脸时也是这么选的（box 面积最大）。
+
+        Raises:
+            SparkBotError: 没人脸能力、没检测到脸、或特征写不进去。
+        """
+        if self.face_db is None or not self.settings.face.enabled:
+            raise SparkBotError("人脸识别未启用")
+        robot = self.robots.get(self.device_id)
+        if not robot.has(CAP_CAMERA):
+            raise SparkBotError(f"设备 {robot.device_id} 没有摄像头")
+
+        scan = await robot.identify_faces()
+        if not scan.faces:
+            raise SparkBotError("这一帧里没有检测到人脸，请让对象正对摄像头再试一次")
+
+        face = max(
+            scan.faces,
+            key=lambda f: max(0, f.box[2] - f.box[0]) * max(0, f.box[3] - f.box[1]),
+        )
+        entry = self.face_db.enroll(name, face.feat, source=role)
+        if entry is None:
+            raise SparkBotError(f"「{name}」不是有效的名字，或人脸特征不完整")
+
+        logger.info("人脸绑定: %s（累计 %d 条特征）", entry["name"], entry["samples"])
+        self.bus.publish(
+            "face.bound", device_id=robot.device_id, name=entry["name"], samples=entry["samples"]
+        )
+        # 同时写进长期记忆：下次对话即使没扫到脸（背对摄像头、光线太暗），
+        # 也还能靠名字与之前聊过的内容认出这个人是"谁"。
+        if self.long_term is not None:
+            with contextlib.suppress(Exception):
+                self.long_term.remember(
+                    f"用户叫{entry['name']}（已绑定人脸）", importance=5, source="face"
+                )
+        return {"ok": True, **entry}
+
+    def _auto_bind_face(self, user_text: str, scan: FaceScan | None) -> None:
+        """用户自报姓名时，自动把眼前这张脸绑上 —— 「自动关联名字」的核心。
+
+        只在**同一轮里既有人说名字、又刚好扫到脸**时才绑，避免：
+        * 有人报名字但画面里没脸（对着摄像头外说话）→ 绑不上去；
+        * 画面里有一堆脸而没报名字 → 不知道绑谁。
+        """
+        if self.face_db is None or scan is None or not scan.faces:
+            return
+        if not self.settings.face.enabled or not self.settings.face.auto_enroll:
+            return
+
+        name = extract_self_name(user_text)
+        if not name:
+            return
+
+        face = max(
+            scan.faces,
+            key=lambda f: max(0, f.box[2] - f.box[0]) * max(0, f.box[3] - f.box[1]),
+        )
+        try:
+            entry = self.face_db.enroll(name, face.feat, source="auto")
+        except Exception as exc:  # noqa: BLE001 - 绑不上不该影响对话
+            logger.debug("自动人脸绑定失败: %s", exc, exc_info=True)
+            return
+        if entry is None:
+            return
+        logger.info("自动人脸绑定: %s（累计 %d 条特征）", entry["name"], entry["samples"])
+        self.bus.publish(
+            "face.bound",
+            device_id=self.device_id,
+            name=entry["name"],
+            samples=entry["samples"],
+            reason="auto",
+        )
 
     # ------------------------------------------------------------------ #
     # 主循环
@@ -452,6 +740,13 @@ class Agent:
             self.memory.append(ChatMessage.user(user_text, images))
             self.bus.publish("agent.user_message", device_id=self.device_id, text=user_text)
 
+            # 先扫一眼"面前是谁"，再让模型开口。
+            # 放在 _think 之前是因为这一轮的 system prompt 需要它；放在锁内
+            # 是因为同一台机器人同时只跑一轮对话，两个扫描抢摄像头没有意义。
+            face_scan, face_hint = await self._look_at_faces()
+            self._face_hint = face_hint
+            turn.faces = [m.to_dict() for m in self._face_matches]
+
             try:
                 await self._think(turn, allow_tools=allow_tools, query=user_text)
             except ProviderError as exc:
@@ -469,6 +764,8 @@ class Agent:
             # 从用户这句话里抽取值得长期记住的事实。
             # 放在 _think 之后：即使模型调用失败，用户刚说的信息也值得记下来。
             self._auto_remember(user_text)
+            # 用户自报姓名 → 把眼前这张脸绑上（"自动关联名字"）。
+            self._auto_bind_face(user_text, face_scan)
 
             if turn.reply:
                 self.bus.publish(

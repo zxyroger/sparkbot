@@ -147,11 +147,34 @@ PC 端控制台 http://127.0.0.1:8765/ 的「设备」栏出现这台机器人�
 | `microphone` | ES8311 ADC，16 kHz PCM 分片上行 | `start_listen` `stop_listen` |
 | `speaker` | ES8311 DAC，WAV / PCM 播放 + 音调 | `play_audio` `play_tone` `set_volume` |
 | `camera` | OV2640 DVP，JPEG 抓帧与推流 | `snapshot` `set_stream` `set_camera_params` |
+| `camera` + 人脸 | esp-dl 本地推理（MSR+MNP 检测、MFN 提特征） | `face_identify` |
 | `battery` | AXP2101 电压 / 电量 / 充电状态 | 遥测 `battery` 字段 |
 | `motor` | 通用双路 H 桥 + 差速 + 开环定时 | `drive` `stop` `set_motion_limits` |
 
 **12 种表情**全部实现（几何绘制，不需要图片资源）：
 `neutral happy sad angry surprised sleepy confused thinking love excited scared bored`
+
+### 人脸识别（本地推理，只回特征）
+
+参考 esp-who 的做法用 esp-dl，在 **S3 上本地推理**，`face_identify` 只回
+512 维特征与人脸框（**不传图片**，约 11KB），名字的绑定在 PC 侧 ——
+见 `sparkbot-esp32/main/bot_face_rec.h` 与 `sparkbot/perception/face.py`。
+
+| 项 | 取值 | 说明 |
+|---|---|---|
+| 检测 | `MSRMNP_S8_V1` | MSR 出候选框 + MNP 关键点精修 |
+| 特征 | `MFN_S8_V1` | 512 维 float32，**已 L2 归一化** |
+| 耗时 | 约 0.4~0.5 秒/帧 | 实测 640x480：解码+检测 87ms，单张脸提特征约 250ms |
+| 上限 | 每帧 4 张脸 | 再多既慢又没用 |
+
+三个 esp-dl 组件的版本必须**一起钉死**（`main/idf_component.yml`）：
+`human_face_recognition ==0.2.0`、`human_face_detect ==0.2.0`、`esp-dl ==3.1.0`。
+版本错配的典型报错是 `DL_IMAGE_CAP_RGB_SWAP` 未定义一类，
+光看错误信息完全猜不到是版本问题（踩过）。
+
+另外 **`bot_face_rec_init()` 必须在网络起来之后调用**：模型常驻要占
+约 840KB 内存，先初始化会把 WiFi 的 malloc 挤失败
+（现象是 `esp_wifi_init → ESP_ERR_NO_MEM` + 无限重启）。
 
 ### 几个实现上的取舍
 
@@ -481,6 +504,37 @@ return self._cache.get(conn.device_id) if conn is None else (...)
 传一个不存在的 `device_id` 就会抛 `AttributeError`，HTTP 层表现为 500。
 → 展开成普通分支。**这类"以为自己写对了"的一行式逻辑，
 最好用反向测试覆盖**（`hw_test.py --negative` 里就有传不存在设备的用例）。
+
+### 14. 人脸推理永远失败 —— JPEG 解码缓冲被算成了 0 字节
+
+现象：调用 `face_identify` 一律回「人脸推理失败」，串口里是
+
+```
+E (133100) JPEG: esp_jpeg_decode(105): Not enough size in output buffer!
+E (133100) dl_image_jpeg: sw_decode_jpeg(41): Failed to decode img.
+```
+
+根因：esp-dl 的 `sw_decode_jpeg()` **不解析 JPEG 头**，它直接拿
+`jpeg_img_t` 自带的 `height * width * 3` 去申请输出缓冲
+（见 `dl_image_jpeg.cpp`）。我们的代码只填了 `data` / `data_size`，
+`width`/`height` 留成了 0 → 输出缓冲 0 字节 → 解码器自己报"缓冲不够"。
+
+修法：先在 `bot_face_rec.cpp` 里用 `esp_jpeg_get_image_info()` 从 JPEG 头
+读出真实尺寸再填进去。**不从调用方传参**是刻意的 —— 少一处"忘了传"的机会，
+顺带还能挡掉"传进来的尺寸和实际 JPEG 不符"。
+
+### 15. 人脸特征按 int8 读，读到的全是垃圾
+
+第一版以为"模型是 int8 量化的，所以输出也是 int8"，于是
+`feat->get_element<int8_t>(i)`。实际上 esp-dl 的 `FeatPostprocessor`
+把特征转成了 **float32 并做了 L2 归一化**，所以按 int8 读等于把
+float 数据的前 512 个字节重解释一遍 —— 数字完全随机，相似度没有意义
+（而且**不会报错**，只会"永远认不出/偶尔认错"）。
+
+正确做法：`feat->dtype` 就是 `DATA_TYPE_FLOAT`，直接
+`const float *src = (const float *)feat->data;`。
+顺带一个好处：**已归一化 → 点积就是余弦相似度**，PC 侧连归一化都省了，
+阈值还能直接沿用 esp-dl `HumanFaceRecognizer` 的默认值 `0.5`。
 
 ### 读串口时不要碰 DTR/RTS
 

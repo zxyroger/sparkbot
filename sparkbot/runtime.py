@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from .brain.agent import Agent, AgentTurn, memory_path
+from .brain.agent import Agent, AgentTurn, face_db_path, memory_path
 from .brain.long_term import get_memory
 from .brain.tools import ToolContext, build_registry, tool_catalog
 from .config import Settings
@@ -29,6 +29,7 @@ from .device.capabilities import RobotProvider
 from .device.gateway import DeviceGateway
 from .device.protocol import EventName
 from .llm.base import LLMProvider, create_provider
+from .perception.face import get_face_db
 from .perception.speech import ASRProvider, TTSProvider, create_asr, create_tts
 from .perception.vision import VisionAnalyzer
 
@@ -582,11 +583,28 @@ class SparkBotRuntime:
             memory.capacity = max(10, settings.memory.capacity)
         self.tool_context.long_term = memory
 
+        # --- 人脸库 ---------------------------------------------------- #
+        # 与长期记忆同理：它是**有状态**的（存着谁是谁），不能每次重建，
+        # 否则刚绑定的名字会消失。取单例，只同步开关与阈值。
+        face_db = None
+        if settings.face.enabled:
+            try:
+                face_db = get_face_db(
+                    face_db_path(settings),
+                    threshold=settings.face.threshold,
+                    max_samples=settings.face.max_samples,
+                    enabled=True,
+                )
+            except Exception:  # noqa: BLE001 - 人脸库坏了不该让服务起不来
+                logger.exception("人脸库初始化失败，本次将以无人脸识别模式运行")
+        self.tool_context.face_db = face_db
+
         for agent in self.agents.all().values():
             agent.settings = settings
             agent.provider = self.provider
             agent.ctx = self.tool_context
             agent.long_term = memory
+            agent.face_db = face_db
 
         if record:
             self.bus.publish(

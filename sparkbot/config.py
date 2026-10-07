@@ -165,6 +165,39 @@ class LongTermMemorySettings(BaseSettings):
     auto_extract: bool = True
 
 
+class FaceSettings(BaseSettings):
+    """人脸识别参数（设备端本地推理 + PC 端名字绑定）。
+
+    推理在 ESP32-S3 上跑（esp-dl 的 MSR+MNP 检测 + MFN 提特征），设备只回
+    512 维特征向量；"这是谁"由 PC 侧的人脸库回答 —— 见 perception/face.py。
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="SPARKBOT_FACE_",
+        extra="ignore",
+        env_file=".env",
+        env_file_encoding="utf-8",
+    )
+
+    # 总开关。关掉后不做摄像头扫描，人脸相关工具会明确回答"未启用"。
+    enabled: bool = True
+    #: 人脸库文件路径（相对项目根目录）。
+    path: str = "artifacts/faces/face_db.json"
+    #: 判定"是同一个人"的余弦相似度阈值。
+    #: 特征在设备端已 L2 归一化，点积即余弦；0.5 沿用 esp-dl
+    #: HumanFaceRecognizer 的默认阈值（同一个模型，判据一致）。
+    threshold: float = 0.5
+    #: 同一个人最多保留几条特征（不同角度各一条，匹配时取最高分）。
+    max_samples: int = 8
+    #: 每轮对话开始前是否自动扫一次脸，把"现在面前是谁"注入上下文。
+    #: 单次约 0.4~0.8 秒（设备端推理），在意响应速度可以关掉。
+    auto_scan: bool = True
+    #: 用户自我介绍（"我叫…""我是…"）时，是否自动把当前这张脸绑到那个名字。
+    auto_enroll: bool = True
+    #: 每轮最多把几个人的身份注入 system prompt。
+    max_injected: int = 2
+
+
 class BehaviorSettings(BaseSettings):
     """Agent 行为策略参数。"""
 
@@ -222,6 +255,7 @@ class Settings(BaseSettings):
     speech: SpeechSettings = Field(default_factory=SpeechSettings)
     behavior: BehaviorSettings = Field(default_factory=BehaviorSettings)
     memory: LongTermMemorySettings = Field(default_factory=LongTermMemorySettings)
+    face: FaceSettings = Field(default_factory=FaceSettings)
 
     # 运行期产物目录（帧、音频、日志）。
     artifacts_dir: str = "artifacts"
@@ -290,6 +324,12 @@ EDITABLE_FIELDS: dict[str, str] = {
     "memory.max_injected": "SPARKBOT_MEMORY_MAX_INJECTED",
     "memory.auto_extract": "SPARKBOT_MEMORY_AUTO_EXTRACT",
     "memory.capacity": "SPARKBOT_MEMORY_CAPACITY",
+    "face.enabled": "SPARKBOT_FACE_ENABLED",
+    "face.threshold": "SPARKBOT_FACE_THRESHOLD",
+    "face.auto_scan": "SPARKBOT_FACE_AUTO_SCAN",
+    "face.auto_enroll": "SPARKBOT_FACE_AUTO_ENROLL",
+    "face.max_injected": "SPARKBOT_FACE_MAX_INJECTED",
+    "face.max_samples": "SPARKBOT_FACE_MAX_SAMPLES",
     "persona": "SPARKBOT_PERSONA",
 }
 

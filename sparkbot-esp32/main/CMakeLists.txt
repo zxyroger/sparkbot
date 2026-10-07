@@ -21,6 +21,7 @@ idf_component_register(
         "bot_face.c"
         "bot_hw_camera.c"
         "bot_wakeword.c"
+        "bot_face_rec.cpp"
     INCLUDE_DIRS "."
     REQUIRES
         esp_http_server
@@ -40,6 +41,11 @@ idf_component_register(
         esp_lcd
         esp32-camera
         esp_codec_dev
+        # esp-dl 人脸检测/特征（本地推理）。human_face_recognition 会带出
+        # human_face_detect + esp-dl + esp_jpeg。
+        espressif__human_face_recognition
+        espressif__human_face_detect
+        esp-dl
         # esp-sr 提供 AFE + WakeNet（本地唤醒词）。
         # 它是可选能力：不在 menuconfig 里打开时，bot_wakeword.c 会
         # 直接返回 ESP_OK 而不引用任何 esp-sr 符号，但组件仍需能链接到。
