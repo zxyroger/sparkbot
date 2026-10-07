@@ -7,6 +7,9 @@ artifacts/
 # 启动脚本写的运行日志与进程号
 logs/
 
+# 临时工作目录（固件构建脚本、抓包、调试录音等一次性文件）
+.tmp/
+
 # Python
 __pycache__/
 *.py[cod]

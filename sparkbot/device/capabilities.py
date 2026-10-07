@@ -15,8 +15,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import io
 import logging
 import time
+import wave
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -92,6 +95,25 @@ class LookResult:
         if include_image:
             payload["image_data_uri"] = self.data_uri
         return payload
+
+
+def audio_duration_s(audio: bytes, fmt: str, sample_rate: int | None = None) -> float | None:
+    """算出一段音频的**精确**播放时长（秒）；算不出返回 ``None``。
+
+    WAV 直接读头里的帧数÷采样率，比"按字节数估算"准得多 ——
+    分段播报要靠它衔接，估算偏一点就会出现抢拍或空档。
+    """
+    name = (fmt or "").lower()
+    if name == "wav":
+        try:
+            with wave.open(io.BytesIO(audio)) as handle:
+                return handle.getnframes() / float(handle.getframerate())
+        except (wave.Error, OSError, ZeroDivisionError):
+            return None
+    if name in ("pcm_s16le", "pcm"):
+        rate = sample_rate or 16000
+        return (len(audio) / 2) / float(rate)
+    return None
 
 
 class Robot:
@@ -461,12 +483,129 @@ class Robot:
         if sample_rate:
             params["sample_rate"] = int(sample_rate)
 
-        # 播放时长不可预知，超时给宽一点：按 16kHz 单声道估算上限。
-        estimated_ms = int(len(audio) / 32) + 3_000
+        # 精确时长优先（分段播报靠它衔接，估算偏一点就会抢拍或留空档）；
+        # 算不出再退回 16kHz 估算（32000 字节/秒 → 每毫秒 32 字节）。
+        duration_s = audio_duration_s(audio, fmt, sample_rate)
+        audio_ms = int((duration_s if duration_s is not None else len(audio) / 32.0) * 1000)
+        estimated_ms = audio_ms + 3_000
+
+        # ``wait=True`` 必须在**发送之前**订阅 audio_done：
+        # 固件并不认 ``wait`` 参数（它一开始播放就回 result），"播完了"是靠
+        # 随后上报的 audio_done 事件表达的。若先发后订阅，短音频可能在订阅
+        # 建立之前就播完，事件被漏掉，只会白等一个超时。
+        if wait:
+            bus = getattr(self.conn, "bus", None)
+            if bus is not None:
+                async with bus.subscribe() as queue:
+                    await self.conn.command(
+                        Action.PLAY_AUDIO, params,
+                        timeout_ms=max(self.settings.device.command_timeout_ms, estimated_ms),
+                    )
+                    done = await self._wait_audio_done(queue, duration_s=duration_s)
+                return {"ok": True, "bytes": len(audio), "format": fmt, "done": done}
+
         await self.conn.command(
             Action.PLAY_AUDIO, params, timeout_ms=max(self.settings.device.command_timeout_ms, estimated_ms)
         )
         return {"ok": True, "bytes": len(audio), "format": fmt}
+
+    async def _wait_device_event(
+        self, queue: asyncio.Queue[Any], name: EventName | str, *, timeout_s: float
+    ) -> bool:
+        """在**独立订阅队列**上等本设备的某个事件，超时返回 ``False``。
+
+        用 EventBus 的订阅队列，而不是 ``conn.events``：后者是所有设备共用的
+        一条队列，从那里等会把同时到达的其它事件（电量、表情、运动完成）
+        一并吞掉。订阅队列是每个订阅者独享的，互不影响。
+        """
+        target = name.value if isinstance(name, EventName) else str(name)
+        deadline = time.monotonic() + timeout_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return False
+            if event.topic != "device.event":
+                continue
+            if event.payload.get("device_id") != self.device_id:
+                continue
+            if event.payload.get("event") == target:
+                return True
+
+    async def _wait_audio_done(
+        self, queue: asyncio.Queue[Any], *, duration_s: float | None
+    ) -> bool:
+        """等设备的 ``audio_done``（播放真的结束），超时返回 ``False``。
+
+        超时上限取"精确时长 + 0.4s"，这里有两个考虑：
+
+        * 事件正常情况下与播放结束同时到达，只等事件最准，衔接无空档；
+        * **不要**另起一个 ``sleep(精确时长)`` 去竞速 —— 两者会在同一刻
+          到期，睡眠经常先返回，于是明明收到了事件还报"等待超时"
+          （这是实测踩过的坑）。
+
+        超时值用 WAV 头的真实时长而不是估算，所以即便固件不发事件
+        （旧固件有回调被 memset 清掉的 bug），也只在句末多停 0.4 秒。
+        """
+        return await self._wait_device_event(
+            queue,
+            EventName.AUDIO_DONE,
+            timeout_s=(duration_s if duration_s is not None else 30.0) + 0.4,
+        )
+
+    async def wait_audio_done(self, *, timeout_s: float = 3.0) -> bool:
+        """等设备把**缓冲区里剩下的音频播完**（``audio_done`` 事件）；超时返回 False。
+
+        为什么需要它：``audio_stream_end`` 只表示"数据发完了"，设备那边
+        还有最多一个环形缓冲（64KB ≈ 2 秒）没播。如果这时候就去开下一轮
+        麦克风采集，设备会**一边播一边上传麦克风音频** —— 主循环被挤住，
+        ``audio_stream_write`` 的应答变慢，推送出现空档，环形缓冲抽干，
+        听感就是"说到一半滋滋"。
+
+        超时给得比环形缓冲略大：正常情况事件很快就到；万一设备没发事件
+        （旧固件），也只在句末多停几秒，不会卡住整条链路。
+        """
+        bus = getattr(self.conn, "bus", None)
+        if bus is None:  # pragma: no cover - 离线替身没有事件总线
+            return False
+        async with bus.subscribe() as queue:
+            return await self._wait_device_event(
+                queue, EventName.AUDIO_DONE, timeout_s=timeout_s
+            )
+
+    # ------------------------------------------------------------------ #
+    # 流式播报（真流式：设备边收边播，段落之间不断流）
+    # ------------------------------------------------------------------ #
+    async def audio_stream_begin(self) -> None:
+        """进入流式播放模式（会打断设备上正在播的内容）。"""
+        self.require(CAP_SPEAKER)
+        await self.conn.command(Action.AUDIO_STREAM_BEGIN, {}, timeout_ms=5_000)
+
+    async def audio_stream_write(self, pcm: bytes) -> int:
+        """往流里追加一块 PCM（板子采样率的单声道 16bit 裸流）。
+
+        返回设备报告的写入字节数。缓冲满时设备侧会等播放任务消费，
+        所以这个调用自带背压 —— 调用方不必额外节流，也就不会把
+        64KB 的播放环形缓冲灌爆。
+        """
+        self.require(CAP_SPEAKER)
+        params = {
+            "encoding": "base64",
+            "data_b64": base64.b64encode(pcm).decode("ascii"),
+        }
+        # 缓冲满时设备会阻塞等消费，单个命令的超时要留够
+        timeout_ms = max(self.settings.device.command_timeout_ms, 10_000)
+        envelope = await self.conn.command(Action.AUDIO_STREAM_WRITE, params,
+                                           timeout_ms=timeout_ms)
+        return int((envelope.raw.get("data") or {}).get("bytes") or 0)
+
+    async def audio_stream_end(self) -> None:
+        """结束流：设备把缓冲里剩下的播完后才上报 ``audio_done``。"""
+        self.require(CAP_SPEAKER)
+        await self.conn.command(Action.AUDIO_STREAM_END, {}, timeout_ms=5_000)
 
     async def play_tone(self, frequency_hz: float = 880.0, duration_ms: int = 120) -> dict[str, Any]:
         """播放一声提示音，用于「听到了」「准备好了」之类即时反馈。"""
@@ -510,6 +649,7 @@ class Robot:
         silence_timeout_s: float = 1.2,
         start: bool = True,
         stale_grace_s: float = 1.5,
+        on_chunk: Callable[[bytes], Awaitable[None]] | None = None,
     ) -> bytes:
         """采集一段语音并返回原始 PCM。
 
@@ -525,6 +665,9 @@ class Robot:
             start: 是否先下发 ``start_listen``（若已在监听可传 ``False``）。
             stale_grace_s: **保护期**。这段时间内收到的 ``end`` 标记视为
                 上一轮遗留并忽略。
+            on_chunk: 每收到一片音频就回调一次（**边收边转**用）。
+                流式识别就是靠它把 20ms 的音频片实时喂给 ASR 服务；
+                回调抛异常不影响采集，只是记一条日志。
 
         Note:
             ``silence_timeout_s`` 与 ``max_seconds`` 是两件事，别混用：
@@ -550,6 +693,7 @@ class Robot:
                 silence_timeout_s=silence_timeout_s,
                 start=start,
                 stale_grace_s=stale_grace_s,
+                on_chunk=on_chunk,
             )
         finally:
             _RECORDING.discard(self.conn.device_id)
@@ -573,6 +717,7 @@ class Robot:
         silence_timeout_s: float,
         start: bool,
         stale_grace_s: float,
+        on_chunk: Callable[[bytes], Awaitable[None]] | None = None,
     ) -> bytes:
         """真正的采集实现；调用前必须已持有该设备的采集权。"""
         if start:
@@ -631,6 +776,13 @@ class Robot:
                 continue
 
             chunks.append(chunk.data)
+            if on_chunk is not None:
+                # 边收边喂给流式识别。回调失败只记日志：识别链路坏了
+                # 不该把采集也带崩，采集完还可以走整段识别的回退路径。
+                try:
+                    await on_chunk(chunk.data)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("音频分片回调失败（流式识别可能已断）: %s", exc)
             if self._has_voice_energy(chunk.data):
                 last_voice = time.monotonic()
 

@@ -26,6 +26,8 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
 import io
 import json
 import logging
@@ -35,7 +37,7 @@ from typing import Any
 
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 logging.basicConfig(
@@ -61,6 +63,48 @@ app = FastAPI(title="SparkBot Local ASR (SenseVoice)")
 _model: Any = None
 _model_name: str = ""
 _load_seconds: float = 0.0
+
+# --------------------------------------------------------------------------- #
+# 流式识别（FunASR Paraformer streaming）
+# --------------------------------------------------------------------------- #
+#:
+#: 为什么用 Paraformer 而不是继续用 SenseVoice：
+#: SenseVoice 是**离线**模型 —— 必须拿到整段音频才能出结果，做不到"边说边出字"。
+#: Paraformer-online 是 FunASR 的流式模型（同一个 venv、同一套依赖），
+#: 按 600ms 一块增量解码，每块都能给出**到目前为止**的文本。
+#:
+#: 代价：识别精度略低于 SenseVoice-large。批处理接口 `/v1/audio/transcriptions`
+#: 仍然用 SenseVoice，两条链路互相独立，哪个更合适由调用方选。
+#: 用 **large** 版本：小版本（speech_paraformer_asr_nat-...-online，280MB）实测
+#: 会把"一台履带式"听成"你台你大师的"，误差大到会影响大模型理解。large 版
+#: 是 848MB，同一条音频基本能读对。这条实测结论值得记下来，别再换回小版本。
+STREAM_MODEL_ID = "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"
+
+#: 600ms 一块（FunASR 约定：单位为 60ms 帧，[0, 10, 5] = 左看 0 / 当前 10 / 右看 5）。
+STREAM_CHUNK_SIZE = [0, 10, 5]
+#: 每块 600ms 的采样数（960 = 60ms @ 16kHz）。
+STREAM_STRIDE = STREAM_CHUNK_SIZE[1] * 960
+STREAM_SAMPLE_RATE = 16000
+
+#: 流式模型句柄与它的互斥锁。
+#: 模型本身是共享的（一份权重），但 torch 前向不适合并发调同一实例 ——
+#: 单机器人场景下串行化最简单也最稳。每个连接有**自己的 cache**（解码状态）。
+_stream_model: Any = None
+_stream_ready = False
+_stream_error: str | None = None
+_stream_load_seconds = 0.0
+_stream_lock = asyncio.Lock()
+
+#: 最终文本用哪个模型出：
+#:   * ``batch`` —— 说完后用 SenseVoice 对整段重识别一次（默认）。
+#:     流式的 partial 照常实时展示，但**最终文本取精度更高的那个**。
+#:     代价：句末多花约 0.3~0.5 秒（与 SenseVoice 的 RTF 一致）。
+#:   * ``stream`` —— 直接用流式模型累积出来的文本，句末零额外延迟，
+#:     但精度略低于 SenseVoice（实测会把"一台履带式"听成"你凯旅带式"）。
+#:
+#: 为什么默认 batch：对这台机器人来说，**回复正确**比省 0.4 秒更重要 ——
+#: 识别错一个字，大模型可能整句答偏。要极致的低延迟就设 stream。
+STREAM_FINAL_MODE = "batch"
 
 
 def load_wav_to_float32(data: bytes) -> np.ndarray:
@@ -130,6 +174,14 @@ async def health() -> dict[str, Any]:
         "status": "ok" if _model is not None else "loading",
         "model": _model_name,
         "load_seconds": round(_load_seconds, 1),
+        # 流式链路的状态单独报：批处理能用、流式没起来，是两种不同的可用性
+        "stream": {
+            "ready": _stream_ready,
+            "model": STREAM_MODEL_ID,
+            "error": _stream_error,
+            "load_seconds": round(_stream_load_seconds, 1),
+            "chunk_ms": 600,
+        },
     }
 
 
@@ -210,9 +262,176 @@ async def transcriptions(
     )
 
 
+# --------------------------------------------------------------------------- #
+# 流式识别
+# --------------------------------------------------------------------------- #
+def _stream_decode(chunk: np.ndarray, cache: dict[str, Any], is_final: bool) -> str:
+    """同步解一块流式音频，返回**到目前为止**的整段文本。
+
+    FunASR 的流式 API 靠 ``cache`` 维护解码状态：每喂一块，返回的是
+    从会话开始累积到现在的文本（不是这一块的增量），所以调用方直接
+    用返回值替换即可，不需要自己拼字符串。
+    """
+    result = _stream_model.generate(
+        input=chunk,
+        cache=cache,
+        is_final=is_final,
+        chunk_size=STREAM_CHUNK_SIZE,
+        encoder_chunk_look_back=4,
+        decoder_chunk_look_back=1,
+    )
+    return extract_text(result)
+
+
+async def _stream_step(chunk: np.ndarray, cache: dict[str, Any], is_final: bool) -> str:
+    """把阻塞的流式前向放到线程里，并用全局锁串行化。"""
+    async with _stream_lock:
+        return await asyncio.to_thread(_stream_decode, chunk, cache, is_final)
+
+
+def _batch_decode(pcm: np.ndarray) -> str:
+    """用批处理模型（SenseVoice）重识别整段，作为最终文本。"""
+    result = _model.generate(
+        input=pcm, cache={}, language="auto", use_itn=True,
+        batch_size_s=60, merge_vad=True, merge_length_s=15,
+    )
+    return extract_text(result)
+
+
+@app.websocket("/v1/audio/stream")
+async def audio_stream(ws: WebSocket) -> None:
+    """流式转写：客户端边推 PCM，服务端边回 partial 文本。
+
+    协议（文本帧 JSON / 二进制帧裸 PCM 混用）::
+
+        服务端 → {"type": "ready", "sample_rate": 16000}
+        客户端 → 二进制帧：16kHz / 16bit / 单声道 little-endian PCM（任意长度）
+        服务端 → {"type": "partial", "text": "到目前为止的文本"}   (可多次)
+        客户端 → {"type": "end"}
+        服务端 → {"type": "final", "text": "...", "audio_seconds": 3.2, ...}
+
+    为什么每块回的是"整段文本"而不是增量：模型本身就是这么给的
+    （见 ``_stream_decode``），而且尾部几个字会随下文修正 —— 让客户端
+    直接替换比让它拼增量更不容易错。
+    """
+    await ws.accept()
+
+    if not _stream_ready:
+        await ws.send_json({"type": "error", "message": _stream_error or "流式模型未就绪"})
+        await ws.close()
+        return
+
+    await ws.send_json({"type": "ready", "sample_rate": STREAM_SAMPLE_RATE})
+
+    cache: dict[str, Any] = {}
+    buffer = np.zeros(0, dtype=np.float32)
+    heard: list[np.ndarray] = []
+    text = ""
+    total = 0
+    t0 = time.perf_counter()
+    infer_s = 0.0
+
+    async def decode(chunk: np.ndarray, is_final: bool) -> None:
+        nonlocal text, infer_s
+        step0 = time.perf_counter()
+        fragment = await _stream_step(chunk, cache, is_final)
+        infer_s += time.perf_counter() - step0
+        if not fragment:
+            return
+
+        # FunASR 的流式接口返回的是**本块新增的片段**（实测：整句由
+        # '你' '好呀' '我是' '小星' … 逐块拼出来），所以要累加。
+        # 同时兼容"返回累积文本"的实现：新片段若以已有文本开头，直接替换。
+        if fragment.startswith(text):
+            merged = fragment
+        elif text.endswith(fragment):
+            merged = text
+        else:
+            merged = text + fragment
+
+        if merged != text:
+            text = merged
+            await ws.send_json({"type": "partial", "text": text})
+
+    try:
+        while True:
+            message = await ws.receive()
+            if message.get("type") == "websocket.disconnect":
+                break
+
+            raw = message.get("bytes")
+            if raw is None:
+                payload = message.get("text")
+                if payload:
+                    with contextlib.suppress(ValueError):
+                        if json.loads(payload).get("type") == "end":
+                            break
+                continue
+
+            pcm = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            total += int(pcm.size)
+            heard.append(pcm)
+            buffer = pcm if buffer.size == 0 else np.concatenate([buffer, pcm])
+
+            # 留最后一块不立刻解：它的下文还没到，早解出来反而会在
+            # 下一块到达时整体改写。等够两块再解，partial 更稳定。
+            while buffer.size >= 2 * STREAM_STRIDE:
+                await decode(buffer[:STREAM_STRIDE], False)
+                buffer = buffer[STREAM_STRIDE:]
+
+        # 收尾：把剩下的（不足一块就补静音）用 is_final 解一次，
+        # 让模型把最后一个字的声学上下文看完，否则尾字常被吃掉。
+        tail = buffer
+        if tail.size < STREAM_STRIDE:
+            tail = np.concatenate([tail, np.zeros(STREAM_STRIDE - tail.size, dtype=np.float32)])
+        await decode(tail, True)
+
+        # 收尾：默认用批处理模型（SenseVoice）复核整段。
+        # 流式的 partial 已经实时给过了，最终文本取更准的那个。
+        if STREAM_FINAL_MODE == "batch" and _model is not None and heard:
+            try:
+                audio = np.concatenate(heard)
+                step0 = time.perf_counter()
+                async with _stream_lock:
+                    refined = await asyncio.to_thread(_batch_decode, audio)
+                infer_s += time.perf_counter() - step0
+                if refined:
+                    text = refined
+                    logger.info("流式收尾: SenseVoice 复核完成（%.0fms）",
+                                (time.perf_counter() - step0) * 1000)
+            except Exception as exc:  # noqa: BLE001 - 复核失败就用流式结果
+                logger.warning("流式收尾复核失败，沿用流式结果: %s", exc)
+
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        audio_s = total / STREAM_SAMPLE_RATE
+        logger.info(
+            "流式识别: 音频 %.2fs -> 端到端 %.0fms（解码 %.0fms, RTF %.3f）| %r",
+            audio_s, elapsed_ms, infer_s * 1000,
+            (infer_s / audio_s) if audio_s > 0 else 0.0, text[:60],
+        )
+        await ws.send_json({
+            "type": "final",
+            "text": text,
+            "audio_seconds": round(audio_s, 3),
+            "elapsed_ms": round(elapsed_ms, 1),
+            "rtf": round((infer_s / audio_s) if audio_s > 0 else 0.0, 4),
+        })
+    except WebSocketDisconnect:
+        logger.info("流式识别连接断开（已收到 %.2fs 音频）", total / STREAM_SAMPLE_RATE)
+    except Exception as exc:  # noqa: BLE001 - 不能让单个会话把服务带崩
+        logger.exception("流式识别失败")
+        with contextlib.suppress(Exception):
+            await ws.send_json({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
+    finally:
+        with contextlib.suppress(Exception):
+            await ws.close()
+
+
 def main() -> int:
     """命令行入口：加载模型后启动 HTTP 服务。"""
     global _model, _model_name, _load_seconds
+    global _stream_model, _stream_ready, _stream_error, _stream_load_seconds
+    global STREAM_FINAL_MODE
 
     p = argparse.ArgumentParser(description="本地 SenseVoice ASR 服务（OpenAI 兼容）")
     p.add_argument("--host", default="127.0.0.1")
@@ -221,7 +440,15 @@ def main() -> int:
     p.add_argument("--model", default="iic/SenseVoiceSmall", help="ModelScope 模型 id")
     p.add_argument("--revision", default=None, help="可选：固定模型版本")
     p.add_argument("--warmup", action="store_true", default=True, help="启动时用静音预热")
+    p.add_argument("--stream-model", default=STREAM_MODEL_ID,
+                   help="流式识别用的 FunASR 模型 id")
+    p.add_argument("--no-stream", action="store_true",
+                   help="不加载流式模型（只保留批处理接口）")
+    p.add_argument("--stream-final", choices=("batch", "stream"), default=STREAM_FINAL_MODE,
+                   help="最终文本来源：batch=用 SenseVoice 复核（准，句末 +0.4s）；"
+                        "stream=直接用流式结果（快，精度略低）")
     args = p.parse_args()
+    STREAM_FINAL_MODE = args.stream_final
 
     logger.info("正在加载模型 %s (device=%s) …", args.model, args.device)
     t0 = time.perf_counter()
@@ -251,6 +478,40 @@ def main() -> int:
         except Exception:  # noqa: BLE001
             logger.warning("预热失败（不影响后续请求）", exc_info=True)
         logger.info("预热完成，耗时 %.1f 秒", time.perf_counter() - t1)
+
+    # ---- 流式模型（Paraformer online） --------------------------------- #
+    if args.no_stream:
+        _stream_error = "已通过 --no-stream 关闭"
+        logger.info("流式识别已关闭（--no-stream）")
+    else:
+        st0 = time.perf_counter()
+        logger.info("正在加载流式模型 %s …", args.stream_model)
+        try:
+            from funasr import AutoModel
+
+            _stream_model = AutoModel(
+                model=args.stream_model,
+                device=args.device,
+                disable_update=True,
+                disable_pbar=True,
+                disable_log=False,
+            )
+            # 预热：跑一次空会话，把图建好。否则第一轮对话会多等好几秒。
+            _stream_model.generate(
+                input=np.zeros(STREAM_STRIDE, dtype=np.float32),
+                cache={},
+                is_final=True,
+                chunk_size=STREAM_CHUNK_SIZE,
+                encoder_chunk_look_back=4,
+                decoder_chunk_look_back=1,
+            )
+            _stream_ready = True
+        except Exception as exc:  # noqa: BLE001 - 流式起不来不影响批处理
+            _stream_error = f"{type(exc).__name__}: {exc}"
+            logger.warning("流式模型加载失败（批处理仍然可用）: %s", _stream_error, exc_info=True)
+        _stream_load_seconds = time.perf_counter() - st0
+        if _stream_ready:
+            logger.info("流式模型就绪，耗时 %.1f 秒（600ms 一块）", _stream_load_seconds)
 
     logger.info("服务启动: http://%s:%d/v1  (health: /health)", args.host, args.port)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

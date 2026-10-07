@@ -538,6 +538,37 @@ export SPARKBOT_SPEECH_TTS_VOICE=alloy
 
 全部配置项见 `.env.example`，也可以在控制台「设置」页里改其中大部分。
 
+#### 流式识别与流式合成（默认走本地 `speech-service/`）
+
+「流式」在这里是**两件不同的事**，各自解决的延迟也不一样：
+
+| 环节 | 流式什么 | 实测收益 |
+|---|---|---|
+| ASR | 边说边推 PCM，**边说边出 partial 文本** | 话一说完就有文本，省掉整段识别的往返 |
+| TTS | **边合成边下发** PCM，设备边收边播 | 首字延迟从"整句合成完"变成"第一块合成完" |
+
+实测（sherpa-onnx + FunASR Paraformer-large，i5-11400）：
+
+```
+TTS 8.5 秒的句子：整段 2.9s → 流式首块 0.55s
+ASR 5.6 秒的语音：话说完 → 最终文本 0.65s（partial 每 0.6s 一条）
+```
+
+协议（都是本地服务加的端点，OpenAI 官方没有；连不上会自动回退整段模式）：
+
+* ASR：`WS /v1/audio/stream` —— 二进制帧推 16k/16bit/单声道 PCM，
+  回 `{"type":"partial"|"final","text":...}`。
+* TTS：`POST /v1/audio/speech/stream` —— 请求体同 `/v1/audio/speech`，
+  响应是**裸 PCM**（无容器），按块返回。
+
+**最终文本默认用 SenseVoice 复核**（`--stream-final batch`）：partial 由
+流式模型实时给，句末再用精度更高的 SenseVoice 重识别一次整段。原因是流式
+模型（Paraformer-online）会把"一台履带式"听成"你凯旅带式"，错字会让大模型
+答偏；代价只有句末约 0.4 秒。要极致低延迟就改 `--stream-final stream`。
+
+关掉流式：ASR 服务加 `--no-stream`；PC 端只要 provider 不支持流式（例如
+直连 OpenAI 云服务）就会自动走原来的整段链路，不需要改配置。
+
 ---
 
 ## 对接真实硬件
@@ -627,6 +658,7 @@ start_all.ps1       PowerShell 等价入口（受执行策略限制，见脚本�
 check.py            启动前自检：一条命令定位「为什么起不来」
 tests/              三个测试套件 + 手动联调脚本
 sparkbot-esp32/     ESP32-S3 固件源码（ESP-IDF 工程，见其 README）
+speech-service/     本地语音服务：ASR(SenseVoice + 流式 Paraformer) / TTS(sherpa-onnx)
 logs/               脚本启动时的运行日志（.gitignore 已忽略）
 ```
 

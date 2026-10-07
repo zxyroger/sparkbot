@@ -12,13 +12,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import array
+import contextlib
+import inspect
 import io
+import json
 import logging
 import math
 import struct
 import wave
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -171,6 +176,10 @@ class ASRProvider(ABC):
 
     name: str = "asr"
 
+    #: 是否支持**边推边识别**（``open_stream``）。不支持时上层回退到
+    #: ``transcribe`` 的整段识别。
+    supports_streaming: bool = False
+
     @abstractmethod
     async def transcribe(self, pcm: bytes, *, sample_rate: int = DEFAULT_SAMPLE_RATE) -> Transcript:
         """把 PCM 音频转成文本。
@@ -179,6 +188,15 @@ class ASRProvider(ABC):
             pcm: 裸 PCM（16-bit）。
             sample_rate: 采样率 Hz。
         """
+
+    async def open_stream(
+        self,
+        *,
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
+        on_partial: Callable[[str], Any] | None = None,
+    ) -> ASRStreamSession:
+        """打开一个流式识别会话。不支持时抛 ``ProviderError``。"""
+        raise ProviderError(f"{self.name} 不支持流式识别")
 
     async def aclose(self) -> None:
         """释放资源。"""
@@ -190,6 +208,9 @@ class TTSProvider(ABC):
 
     name: str = "tts"
 
+    #: 是否支持**边合成边出音频**（``synthesize_stream``）。
+    supports_streaming: bool = False
+
     @abstractmethod
     async def synthesize(self, text: str) -> tuple[bytes, str]:
         """把文本合成音频，返回 ``(字节, 格式)``。
@@ -198,9 +219,139 @@ class TTSProvider(ABC):
         ``PLAY_AUDIO.format`` 下发给设备。
         """
 
+    async def synthesize_stream(
+        self, text: str, *, sample_rate: int = DEFAULT_SAMPLE_RATE
+    ) -> AsyncIterator[bytes]:
+        """流式合成：**边生成边 yield** 裸 PCM（16bit 单声道，指定采样率）。
+
+        调用方拿到一块就能往设备推一块，首字延迟与文本长度基本无关。
+        不支持流式的实现抛 ``ProviderError``，由上层回退到整段合成。
+        """
+        raise ProviderError(f"{self.name} 不支持流式合成")
+        yield b""  # pragma: no cover - 让函数体成为异步生成器
+
     async def aclose(self) -> None:
         """释放资源。"""
         return None
+
+
+# --------------------------------------------------------------------------- #
+# 流式识别会话
+# --------------------------------------------------------------------------- #
+class ASRStreamSession:
+    """一次流式识别会话的客户端句柄。
+
+    生命周期：``open_stream()`` → ``push()`` × N → ``finish()`` → ``aclose()``。
+
+    * ``push()`` 送一块 PCM 就能立刻继续（**不需要等识别结果**）；
+    * 服务端的 partial 文本通过 ``on_partial`` 回调实时抛出来；
+    * ``finish()`` 告诉服务端音频结束，返回最终文本。
+
+    这个基类只管状态与回调，真正的传输由子类实现
+    （WebSocket 见 :class:`_WSASRStream`；离线替身见 :class:`MockASR`）。
+    """
+
+    def __init__(self, on_partial: Callable[[str], Any] | None = None) -> None:
+        self._on_partial = on_partial
+        self._text = ""
+        self._final: str | None = None
+        self._error: str | None = None
+        self._done = asyncio.Event()
+
+    @property
+    def text(self) -> str:
+        """到目前为止的文本（partial 或 final）。"""
+        return self._text
+
+    @property
+    def final(self) -> str | None:
+        """最终文本；还没结束时为 ``None``。"""
+        return self._final
+
+    def _emit_partial(self, text: str) -> None:
+        """收到一段 partial：更新文本并回调（回调失败不影响识别）。"""
+        if not text or text == self._text:
+            return
+        self._text = text
+        if self._on_partial is None:
+            return
+        try:
+            result = self._on_partial(text)
+            if inspect.isawaitable(result):
+                # 回调方是任意同步/异步函数，这里不阻塞识别链路
+                asyncio.ensure_future(result)  # noqa: RUF006 - 结果无处可归，失败在内部吞掉
+        except Exception:  # noqa: BLE001 - 回调只是"通知"，不该影响识别
+            logger.debug("partial 回调失败", exc_info=True)
+
+    def _emit_final(self, text: str, error: str | None = None) -> None:
+        """会话结束（正常或出错）。"""
+        if text:
+            self._text = text
+        self._final = self._text
+        if error:
+            self._error = error
+        self._done.set()
+
+    async def push(self, pcm: bytes) -> None:
+        """送一块 PCM（16kHz / 16bit / 单声道）。子类实现。"""
+
+    async def finish(self, timeout_s: float = 15.0) -> str:
+        """音频结束，等最终文本；超时返回已有的 partial。"""
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self._done.wait(), timeout_s)
+        if self._error and not self._text:
+            raise ProviderError(f"流式识别失败: {self._error}")
+        return self._text
+
+    async def aclose(self) -> None:
+        """释放连接（幂等）。"""
+
+
+class _WSASRStream(ASRStreamSession):
+    """基于 WebSocket 的流式识别会话。"""
+
+    def __init__(self, ws: Any, on_partial: Callable[[str], Any] | None = None) -> None:
+        super().__init__(on_partial)
+        self._ws = ws
+        self._reader = asyncio.ensure_future(self._read_loop())
+
+    async def _read_loop(self) -> None:
+        try:
+            async for message in self._ws:
+                if isinstance(message, (bytes, bytearray)):
+                    continue
+                try:
+                    data = json.loads(message)
+                except ValueError:
+                    continue
+                kind = data.get("type")
+                if kind == "partial":
+                    self._emit_partial(str(data.get("text") or ""))
+                elif kind == "final":
+                    self._emit_final(str(data.get("text") or ""))
+                    return
+                elif kind == "error":
+                    self._emit_final("", error=str(data.get("message") or "未知错误"))
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 连接断了就按失败收尾
+            self._emit_final("", error=f"{type(exc).__name__}: {exc}")
+        finally:
+            self._done.set()
+
+    async def push(self, pcm: bytes) -> None:
+        await self._ws.send(bytes(pcm))
+
+    async def finish(self, timeout_s: float = 15.0) -> str:
+        with contextlib.suppress(Exception):
+            await self._ws.send(json.dumps({"type": "end"}))
+        return await super().finish(timeout_s)
+
+    async def aclose(self) -> None:
+        self._reader.cancel()
+        with contextlib.suppress(Exception):
+            await self._ws.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -212,6 +363,13 @@ class OpenAISpeech(ASRProvider, TTSProvider):
     ``name`` 会被实例级覆盖（``openai-asr`` / ``openai-tts``），
     便于日志里一眼看出是哪条链路。
     """
+
+    #: 本地语音服务（speech-service/）在这套 OpenAI 协议之上加了流式端点：
+    #:   * ASR: WebSocket ``/v1/audio/stream``（边推边出 partial 文本）
+    #:   * TTS: ``POST /v1/audio/speech/stream``（边合成边出 PCM）
+    #: 走 OpenAI 官方云服务时这两个端点不存在，上层会捕获 ProviderError
+    #: 并回退到整段模式，所以这里的 True 是"值得一试"而非"一定可用"。
+    supports_streaming = True
 
     def __init__(
         self,
@@ -252,6 +410,49 @@ class OpenAISpeech(ASRProvider, TTSProvider):
         if json_body:
             headers["Content-Type"] = "application/json"
         return headers
+
+    def _ws_url(self, suffix: str) -> str:
+        """把 base_url 换成 WebSocket 地址：``http(s)://host/v1`` → ``ws(s)://host/v1<suffix>``。"""
+        base = self.base_url
+        if base.startswith("https://"):
+            base = "wss://" + base[len("https://"):]
+        elif base.startswith("http://"):
+            base = "ws://" + base[len("http://"):]
+        return base.rstrip("/") + suffix
+
+    async def open_stream(
+        self,
+        *,
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
+        on_partial: Callable[[str], Any] | None = None,
+    ) -> ASRStreamSession:
+        """打开流式识别 WebSocket 会话。
+
+        Raises:
+            ProviderError: 服务端没有流式端点、连不上、或没加载流式模型。
+        """
+        import websockets  # 延迟导入：只有真的用流式才需要
+
+        url = self._ws_url("/audio/stream")
+        try:
+            ws = await websockets.connect(url, max_size=None, ping_interval=None, open_timeout=10)
+        except Exception as exc:  # noqa: BLE001 - 统一转成 ProviderError 让上层回退
+            raise ProviderError(f"流式识别连接失败（{url}）: {exc}") from exc
+
+        try:
+            hello = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+        except Exception as exc:  # noqa: BLE001
+            with contextlib.suppress(Exception):
+                await ws.close()
+            raise ProviderError(f"流式识别握手失败: {exc}") from exc
+
+        if hello.get("type") != "ready":
+            with contextlib.suppress(Exception):
+                await ws.close()
+            raise ProviderError(f"流式识别不可用: {hello.get('message') or hello}")
+
+        logger.info("流式识别已连接: %s（%s Hz）", url, hello.get("sample_rate", sample_rate))
+        return _WSASRStream(ws, on_partial)
 
     # ------------------------------------------------------------------ #
     # ASR
@@ -331,6 +532,49 @@ class OpenAISpeech(ASRProvider, TTSProvider):
 
         return response.content, self.tts_format
 
+    async def synthesize_stream(
+        self, text: str, *, sample_rate: int = DEFAULT_SAMPLE_RATE
+    ) -> AsyncIterator[bytes]:
+        """流式合成：请求 ``/audio/speech/stream``，**边收边 yield** 裸 PCM。
+
+        服务端每合成出一小块就推一块，所以第一块通常几百毫秒就到了，
+        不必等整句算完（整句可能要几秒）。
+
+        Yields:
+            16bit 单声道 little-endian PCM，采样率为 ``sample_rate``。
+
+        Raises:
+            ProviderError: 服务端没有流式端点或合成失败（上层回退整段合成）。
+        """
+        cleaned = text.strip()
+        if not cleaned:
+            return
+
+        payload = {
+            "model": self.tts_model,
+            "voice": self.tts_voice,
+            "input": cleaned,
+            "sample_rate": int(sample_rate),
+        }
+        client = await self._get_client()
+        try:
+            async with client.stream(
+                "POST",
+                f"{self.base_url}/audio/speech/stream",
+                headers=self._headers(json_body=True),
+                json=payload,
+            ) as response:
+                if response.status_code >= 400:
+                    body = (await response.aread())[:300]
+                    raise ProviderError(
+                        f"流式 TTS 返回 HTTP {response.status_code}: {body.decode('utf-8', 'replace')}"
+                    )
+                async for chunk in response.aiter_bytes():
+                    if chunk:
+                        yield chunk
+        except httpx.HTTPError as exc:
+            raise ProviderError(f"流式 TTS 网络错误: {exc}") from exc
+
 
 # --------------------------------------------------------------------------- #
 # 离线实现
@@ -349,6 +593,8 @@ class MockASR(ASRProvider):
         #: 记录收到的音频总时长，便于调试采集是否正常。
         self.total_seconds = 0.0
 
+    supports_streaming = True
+
     async def transcribe(self, pcm: bytes, *, sample_rate: int = DEFAULT_SAMPLE_RATE) -> Transcript:
         """返回占位文本。"""
         duration = pcm_duration_s(pcm, sample_rate=sample_rate)
@@ -362,6 +608,32 @@ class MockASR(ASRProvider):
             provider=self.name,
         )
 
+    async def open_stream(
+        self,
+        *,
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
+        on_partial: Callable[[str], Any] | None = None,
+    ) -> ASRStreamSession:
+        """离线替身：本地累计时长，结束时给出占位文本。
+
+        没有真实解码，所以只在结束时抛一次 final —— 目的是让上层的
+        **流式调用路径**（推块、回调、收尾）在没有 ASR 服务时也能被测到。
+        """
+        session = ASRStreamSession(on_partial)
+        state = {"bytes": 0}
+
+        async def _push(pcm: bytes) -> None:
+            state["bytes"] += len(pcm)
+
+        async def _finish(timeout_s: float = 15.0) -> str:
+            duration = state["bytes"] / 2 / float(sample_rate or DEFAULT_SAMPLE_RATE)
+            session._emit_final(self.placeholder if duration >= 0.25 else "")  # noqa: SLF001
+            return session.text
+
+        session.push = _push  # type: ignore[method-assign]
+        session.finish = _finish  # type: ignore[method-assign]
+        return session
+
 
 class MockTTS(TTSProvider):
     """离线 TTS：用音高序列代替真人语音，返回合法 WAV。"""
@@ -373,10 +645,25 @@ class MockTTS(TTSProvider):
         #: 最近一次合成的文本，便于测试断言。
         self.last_text = ""
 
+    supports_streaming = True
+
     async def synthesize(self, text: str) -> tuple[bytes, str]:
         """合成提示音 WAV。"""
         self.last_text = text
         return speech_wav(text, sample_rate=self.sample_rate), "wav"
+
+    async def synthesize_stream(
+        self, text: str, *, sample_rate: int = DEFAULT_SAMPLE_RATE
+    ) -> AsyncIterator[bytes]:
+        """离线替身：整段合成后按块吐出来（模拟流式的**调用形态**）。"""
+        self.last_text = text
+        wav = speech_wav(text, sample_rate=self.sample_rate)
+        pcm, rate, _channels = wav_to_pcm(wav)
+        if rate != sample_rate:
+            raise ProviderError(f"离线 TTS 采样率 {rate} 与请求的 {sample_rate} 不一致")
+        step = 4096
+        for off in range(0, len(pcm), step):
+            yield pcm[off:off + step]
 
 
 # --------------------------------------------------------------------------- #

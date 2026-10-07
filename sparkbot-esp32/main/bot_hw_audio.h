@@ -123,6 +123,23 @@ esp_err_t bot_audio_play(const uint8_t *data, size_t len, bool is_wav, int sampl
  */
 esp_err_t bot_audio_play_raw_i16(const int16_t *samples, size_t count);
 
+/*
+ * 流式播放：边收边播，段落之间不断流。
+ *
+ * 与 bot_audio_play() 的区别是它**不会**在每块数据之间判定"播放结束"——
+ * 流式期间缓冲短暂空掉只代表"PC 还没推下一块"。用法：
+ *
+ *     bot_audio_stream_begin();
+ *     bot_audio_stream_write(pcm, samples);   // 可重复多次
+ *     bot_audio_stream_end();                 // 缓冲播完后才发 audio_done
+ *
+ * 数据必须是板子采样率的单声道 16bit 裸 PCM（不做重采样）。
+ */
+esp_err_t bot_audio_stream_begin(void);
+esp_err_t bot_audio_stream_write(const int16_t *samples, size_t count);
+esp_err_t bot_audio_stream_end(void);
+bool bot_audio_stream_active(void);
+
 /* 立刻停止播放 */
 void bot_audio_stop_playback(void);
 

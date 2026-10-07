@@ -39,6 +39,10 @@ static const char *TAG = "bot_proto";
 #define TELEMETRY_INTERVAL_MS 5000
 #define PING_INTERVAL_MS 30000
 
+/* 链路静默上限：PC 每 30 秒发一次 ping，连续 3 个周期没收到**任何**消息
+ * 就判定为"半开连接"，主动断开让主循环重连。详见 bot_proto_poll。 */
+#define LINK_SILENCE_TIMEOUT_MS 90000
+
 typedef struct {
     char device_id[48];
     char device_name[64];
@@ -47,6 +51,9 @@ typedef struct {
     int64_t last_telemetry_us;
     int64_t last_ping_us;
     int64_t last_pong_us;
+    /* 最近一次收到 PC 消息的时刻（任何消息，含 ping / 命令 / 解析失败的）。
+     * 它是半开连接的唯一判据 —— 只看 recv 返回值发现不了对端已经消失。 */
+    int64_t last_rx_us;
 
     /* 监听状态 */
     volatile bool listening;
@@ -59,6 +66,21 @@ typedef struct {
 } proto_ctx_t;
 
 static proto_ctx_t s_p;
+
+/*
+ * "音频播完了"的待发标志。
+ *
+ * 音频任务（bot_spk，栈只有 4096 字节）的 done 回调**不能直接发 WebSocket**
+ * ——构造并发送一帧 JSON 会栈溢出，板子当场 panic 重启（实测现象就是
+ * "每次播放结束就掉线重连、uptime 归零"）。所以回调只置这个标志，
+ * 真正的发送由主循环里的 bot_proto_poll() 完成。
+ */
+static volatile bool s_audio_done_pending = false;
+
+void bot_proto_notify_audio_done(void)
+{
+    s_audio_done_pending = true;
+}
 
 /* ------------------------------------------------------------------ */
 /* 参数辅助                                                           */
@@ -458,6 +480,7 @@ esp_err_t bot_proto_handshake(void)
                          bot_param_str(msg, "session", "?"), heartbeat);
                 s_p.handshake_ok = true;
                 s_p.last_telemetry_us = 0; /* 立刻发第一条遥测 */
+                s_p.last_rx_us = esp_timer_get_time(); /* 静默计时从握手成功算起 */
                 cJSON_Delete(msg);
                 return ESP_OK;
             }
@@ -480,6 +503,11 @@ void bot_proto_on_disconnect(void)
 {
     s_p.handshake_ok = false;
     s_p.listening = false;
+    s_p.last_rx_us = 0; /* 断线期间不做静默判定 */
+    s_audio_done_pending = false; /* 断线时丢弃待发的 audio_done，避免重连后补发旧的 */
+    /* 断线时退出流式模式：否则 stream_active 一直为真，
+     * 缓冲播空后 audio_done 永远不会触发。 */
+    bot_audio_stream_end();
     /*
      * 只关上行，**不关麦克风**。
      *
@@ -828,6 +856,97 @@ static cJSON *exec_action(const char *action, const cJSON *params,
         return NULL;
     }
 
+    /* ---- 流式播放：begin → write × N → end ---------------------------- */
+    if (strcmp(action, BOT_ACT_AUDIO_STREAM_BEGIN) == 0) {
+        if (!bot_audio_ready()) {
+            if (want_reply) {
+                REPLY_ERR(BOT_ERR_HARDWARE_FAULT, "本机未启用音频");
+            }
+            return NULL;
+        }
+        if (bot_audio_stream_begin() != ESP_OK) {
+            if (want_reply) {
+                REPLY_ERR(BOT_ERR_INTERNAL, "进入流式播放失败");
+            }
+            return NULL;
+        }
+        cJSON *d = cJSON_CreateObject();
+        cJSON_AddBoolToObject(d, "streaming", true);
+        return d;
+    }
+
+    if (strcmp(action, BOT_ACT_AUDIO_STREAM_WRITE) == 0) {
+        if (!bot_audio_ready() || !bot_audio_stream_active()) {
+            if (want_reply) {
+                REPLY_ERR(BOT_ERR_BAD_PARAMS, "未处于流式播放（请先发 audio_stream_begin）");
+            }
+            return NULL;
+        }
+
+        const char *b64 = bot_param_str(params, "data_b64", NULL);
+        if (b64 == NULL || b64[0] == '\0') {
+            if (want_reply) {
+                REPLY_ERR(BOT_ERR_BAD_PARAMS, "缺少 data_b64");
+            }
+            return NULL;
+        }
+
+        size_t b64_len = strlen(b64);
+        size_t cap = (b64_len / 4 + 1) * 3 + 4;
+        /*
+         * 解码缓冲优先放 PSRAM。内部 RAM 常态只剩一百多 KB，而一块
+         * 16KB 的 PCM base64 之后是 21KB；用内部 RAM 会在连续推送时
+         * 把网络收发路径一起拖垮（表现是设备莫名掉线）。
+         */
+        uint8_t *raw = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+        if (raw == NULL) {
+            ESP_LOGW(TAG, "PSRAM 分配 %u 字节失败，退回内部 RAM", (unsigned)cap);
+            raw = malloc(cap);
+        }
+        if (raw == NULL) {
+            if (want_reply) {
+                REPLY_ERR(BOT_ERR_INTERNAL, "内存不足");
+            }
+            return NULL;
+        }
+
+        size_t raw_len = 0;
+        if (mbedtls_base64_decode(raw, cap, &raw_len,
+                                  (const unsigned char *)b64, b64_len) != 0) {
+            free(raw);
+            if (want_reply) {
+                REPLY_ERR(BOT_ERR_BAD_PARAMS, "data_b64 不是合法 base64");
+            }
+            return NULL;
+        }
+
+        esp_err_t err = bot_audio_stream_write((const int16_t *)raw, raw_len / 2);
+        free(raw);
+        if (err != ESP_OK) {
+            if (want_reply) {
+                REPLY_ERR(BOT_ERR_INTERNAL, "写入流式缓冲失败");
+            }
+            return NULL;
+        }
+
+        cJSON *d = cJSON_CreateObject();
+        cJSON_AddNumberToObject(d, "bytes", (double)raw_len);
+        return d;
+    }
+
+    if (strcmp(action, BOT_ACT_AUDIO_STREAM_END) == 0) {
+        if (!bot_audio_ready()) {
+            if (want_reply) {
+                REPLY_ERR(BOT_ERR_HARDWARE_FAULT, "本机未启用音频");
+            }
+            return NULL;
+        }
+        bot_audio_stream_end();
+        cJSON *d = cJSON_CreateObject();
+        cJSON_AddBoolToObject(d, "streaming", false);
+        return d;
+    }
+
     if (strcmp(action, BOT_ACT_PLAY_TONE) == 0) {
         if (!bot_audio_ready()) {
             if (want_reply) {
@@ -984,6 +1103,10 @@ static cJSON *exec_action(const char *action, const cJSON *params,
 
 void bot_proto_handle_message(const char *json, size_t len)
 {
+    /* 收到任何东西都算链路活着 —— 连解析失败的也算：对端还在发包，
+     * 就说明连接没死。这个时刻是半开连接检测的输入。 */
+    s_p.last_rx_us = esp_timer_get_time();
+
     cJSON *msg = cJSON_ParseWithLength(json, len + 1);
     if (msg == NULL) {
         ESP_LOGW(TAG, "收到无法解析的 JSON（%u 字节）", (unsigned)len);
@@ -1164,10 +1287,34 @@ void bot_proto_poll(void)
 
     int64_t now = esp_timer_get_time();
 
+    /*
+     * 半开连接检测（必须放在其它工作之前）。
+     *
+     * 背景：PC 重启后这条 TCP 其实已经作废，但本机 recv 只会一直返回超时，
+     * 看起来"还连着"，于是**永远不进主循环的重连分支** —— 实测板子会一直
+     * 保持"假在线"，直到手动复位。PC 每 30 秒发一次 ping，所以静默超过
+     * 3 个周期就说明对端确实没了，这里主动断开，交给主循环重连。
+     */
+    if (s_p.last_rx_us != 0 &&
+        now - s_p.last_rx_us > (int64_t)LINK_SILENCE_TIMEOUT_MS * 1000) {
+        ESP_LOGW(TAG, "链路静默 %lld ms（上限 %d ms），判定对端已断开，主动重连",
+                 (long long)((now - s_p.last_rx_us) / 1000), LINK_SILENCE_TIMEOUT_MS);
+        bot_net_disconnect();
+        bot_proto_on_disconnect();
+        return;
+    }
+
     /* 遥测 */
     if (now - s_p.last_telemetry_us >= (int64_t)TELEMETRY_INTERVAL_MS * 1000) {
         s_p.last_telemetry_us = now;
         send_telemetry();
+    }
+
+    /* 音频播完 → 在这里补发 audio_done（见 s_audio_done_pending 的说明：
+     * 音频任务栈太小，发不了 WebSocket，只能挪到主循环来发）。 */
+    if (s_audio_done_pending) {
+        s_audio_done_pending = false;
+        bot_proto_send_event(BOT_EVT_AUDIO_DONE, NULL);
     }
 
     /* ping 保活：PC 端 30s 没收到任何消息会判定掉线，

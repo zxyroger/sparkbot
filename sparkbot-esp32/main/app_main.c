@@ -56,10 +56,18 @@ static void on_camera_frame(const uint8_t *jpeg, size_t len,
     bot_proto_send_frame(jpeg, len, width, height);
 }
 
-/* 音频播完 → 发 audio_done 事件（PC 端可以用它做"说完再听"的时序） */
+/*
+ * 音频播完 → 通知主循环去发 audio_done 事件
+ * （PC 端用它做"说完再听"的时序，分段播报也靠它衔接）。
+ *
+ * 这里**只置标志**，不能直接调 bot_proto_send_event：本回调跑在音频任务
+ * bot_spk 里，那个任务的栈只有 4096 字节（见 bot_hw_audio.c 的
+ * xTaskCreate(play_task, "bot_spk", 4096, ...)），构造并发送一帧 JSON 会
+ * 栈溢出、板子当场重启。发送改由主循环的 bot_proto_poll() 完成。
+ */
 static void on_audio_done(void)
 {
-    bot_proto_send_event(BOT_EVT_AUDIO_DONE, NULL);
+    bot_proto_notify_audio_done();
 }
 
 /* 开环定时走完 → 发 motion_done 事件 */
@@ -119,11 +127,16 @@ static void init_hardware(void)
         bot_display_show_text("BOOT", 1500);
     }
 
-    /* 3. 音频 */
-    bot_audio_set_done_cb(on_audio_done);
+    /* 3. 音频
+     *
+     * ⚠️ 回调必须在 bot_audio_init() **之后**注册。
+     * bot_audio_init() 第一句是 memset(&s_a, 0, sizeof(s_a))，
+     * 先注册会被当场清成 NULL —— 表现是串口能看到"播放结束"，
+     * 但 audio_done 事件永远发不出去，PC 侧只能靠估算时长衔接分段播报。 */
     if (bot_audio_init() != ESP_OK) {
         ESP_LOGW(TAG, "音频初始化失败");
     }
+    bot_audio_set_done_cb(on_audio_done);
 
     /* 3a. **常开麦克风** —— 让唤醒词能一直听。
      *

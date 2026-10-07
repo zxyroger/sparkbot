@@ -19,11 +19,14 @@
 from __future__ import annotations
 
 import asyncio
+import array
 import base64
 import contextlib
 import hashlib
 import logging
+import math
 import time
+import wave
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -41,6 +44,74 @@ from .device.protocol import Emotion
 from .runtime import SparkBotRuntime
 
 logger = logging.getLogger(__name__)
+
+
+def _debug_tone_pcm(
+    seconds: float, *, tone_hz: float = 440.0, rate: int = 16000, amplitude: float = 0.5
+) -> bytes:
+    """生成一段带淡入淡出的**纯正弦** PCM（16bit 单声道），供喇叭自检使用。
+
+    用纯音而不是语音：语音的频谱本来就复杂，录音里分不清哪些成分是
+    "该有的"、哪些是噪声；纯音的频谱只有一根线，多出来的东西一眼可见。
+    """
+    total = max(1, int(rate * seconds))
+    fade = max(1, int(rate * 0.02))  # 20ms 淡入淡出，避免起止爆音
+    samples = array.array("h")
+    for index in range(total):
+        envelope = min(1.0, index / fade, (total - index) / fade)
+        value = amplitude * envelope * math.sin(2.0 * math.pi * tone_hz * index / rate)
+        samples.append(int(value * 32767))
+    return samples.tobytes()
+
+
+def _debug_peak(pcm: bytes) -> int:
+    """PCM 峰值（绝对值最大）。"""
+    if not pcm:
+        return 0
+    usable = len(pcm) - (len(pcm) % 2)
+    samples = array.array("h")
+    samples.frombytes(pcm[:usable])
+    return max((abs(s) for s in samples), default=0)
+
+
+#: 喇叭自检用的固定文本 —— 包含长句、逗号停顿和多个声母，覆盖容易出问题的段落。
+_DEBUG_SPEECH_TEXT = (
+    "我是一台叫小星的履带式桌面机器人，身上有屏幕、麦克风和喇叭。"
+    "我平时用表情表达心情，开心就笑，困惑就歪头。"
+)
+
+
+async def _debug_synthesize(runtime: Any, text: str) -> bytes:
+    """用当前 TTS 流式合成一段语音，返回裸 PCM（16k 单声道）。
+
+    走的就是 agent 播报时用的那条路（``synthesize_stream``），
+    所以录下来的就是"用户实际听到的东西"。
+    """
+    tts = getattr(runtime, "tts", None)
+    if tts is None:
+        return b""
+    chunks: list[bytes] = []
+    try:
+        async for chunk in tts.synthesize_stream(text, sample_rate=16000):
+            if chunk:
+                chunks.append(chunk)
+    except Exception:  # noqa: BLE001 - 退回整段合成
+        logger.warning("流式合成不可用，改用整段合成做自检", exc_info=True)
+        audio, fmt = await tts.synthesize(text)
+        if not audio:
+            return b""
+        if fmt == "wav":
+            import io as _io
+
+            with wave.open(_io.BytesIO(audio), "rb") as handle:
+                frames = handle.readframes(handle.getnframes())
+                rate = handle.getframerate()
+                channels = handle.getnchannels()
+            if channels > 1 or rate != 16000:
+                return b""
+            return frames
+        return audio
+    return b"".join(chunks)
 
 
 # --------------------------------------------------------------------------- #
@@ -859,6 +930,118 @@ def _register_routes(app: FastAPI) -> None:
         return await runtime.test_llm()
 
     # ---------------------------------------------------------------- #
+    # 喇叭自检：把"听感"变成可测量的数字
+    # ---------------------------------------------------------------- #
+    @app.post("/api/debug/speaker_loopback")
+    async def speaker_loopback(
+        request: Request, payload: dict[str, Any] = Body(default={})
+    ) -> dict[str, Any]:
+        """一边让喇叭放测试音，一边用**板载麦克风**录下来，落盘成 WAV。
+
+        为什么需要它：用户说"滋滋响"这种主观描述没法定位 —— 是合成音色、
+        是传输方式、还是功放/供电？这里放一段**纯正弦音**（没有任何语音
+        成分）并录下实际发声，之后用频谱就能分清：
+
+        * 录音里只有 440Hz 和少量谐波 → 播放链路是干净的；
+        * 出现宽带噪声/周期脉冲 → 功放、供电或 I2S 的问题；
+        * ``mode=batch`` 与 ``mode=stream`` 两次录制的差异 → 传输方式的问题。
+
+        请求体:: {"device_id": "...", "mode": "batch|stream", "seconds": 5,
+                  "tone_hz": 440}
+        """
+        runtime = _runtime(request)
+        robot = runtime.robots.try_get(payload.get("device_id") or None)
+        if robot is None:
+            raise HTTPException(status_code=409, detail="没有在线设备")
+        if not robot.has("microphone") or not robot.has("speaker"):
+            raise HTTPException(status_code=409, detail="设备需要同时有麦克风和喇叭")
+
+        seconds = max(1.0, min(20.0, float(payload.get("seconds") or 5.0)))
+        tone_hz = float(payload.get("tone_hz") or 440.0)
+        level = max(0.02, min(1.0, float(payload.get("level") or 0.5)))
+        mode = str(payload.get("mode") or "batch").lower()
+        signal = str(payload.get("signal") or "tone").lower()
+        do_record = bool(payload.get("record", True))
+        do_face = bool(payload.get("face", False))
+        #: 判"说完"的静音时长。只录音的对照场景要调大，否则房间一安静就提前收尾，
+        #: 录不到后面真正要听的播报。
+        silence_s = float(payload.get("silence_s") or (seconds if signal == "none" else 1.2))
+
+        if signal == "none":
+            # 对照组：只录音、不播放。用来区分"录音里的毛刺是喇叭发的"
+            # 还是"麦克风/I2S RX 自己产生的" —— 后者在本板上是已知问题。
+            pcm = b""
+        elif signal == "speech":
+            # 录**真实语音**：这才是用户实际听到的东西。纯音只能验证
+            # 播放链路本身，验证不了"语音内容里有没有毛刺"。
+            text = str(payload.get("text") or _DEBUG_SPEECH_TEXT)
+            pcm = await _debug_synthesize(runtime, text)
+            if not pcm:
+                raise HTTPException(status_code=503, detail="语音合成不可用（TTS 未启用）")
+            seconds = max(seconds, len(pcm) / 2 / 16000)
+        else:
+            pcm = _debug_tone_pcm(seconds, tone_hz=tone_hz, amplitude=level)
+
+        async def _play() -> None:
+            # 等麦克风真正开起来再出声，否则录音会缺掉起头
+            await asyncio.sleep(0.6 if do_record else 0.05)
+            if not pcm:
+                return
+            if do_face:
+                # 复现 agent 的现场：播报前先刷一次表情（LCD 走 SPI DMA）
+                with contextlib.suppress(Exception):
+                    await robot.set_face(Emotion.HAPPY, intensity=0.9)
+            if mode == "stream":
+                await robot.audio_stream_begin()
+                try:
+                    for off in range(0, len(pcm), 4096):
+                        await robot.audio_stream_write(pcm[off:off + 4096])
+                finally:
+                    with contextlib.suppress(Exception):
+                        await robot.audio_stream_end()
+            else:
+                await robot.say(pcm, fmt="pcm_s16le", sample_rate=16000)
+
+        play_task = asyncio.create_task(_play())
+        try:
+            if do_record:
+                recorded = await robot.collect_audio(
+                    max_seconds=seconds + 2.5, silence_timeout_s=silence_s
+                )
+            else:
+                await play_task
+                recorded = b""
+        finally:
+            with contextlib.suppress(Exception):
+                await play_task
+
+        out_dir = Path("artifacts") / "debug"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"loopback_{signal}_{mode}_{int(time.time())}.wav"
+        if recorded:
+            with wave.open(str(path), "wb") as handle:
+                handle.setnchannels(1)
+                handle.setsampwidth(2)
+                handle.setframerate(16000)
+                handle.writeframes(recorded)
+
+        logger.info(
+            "喇叭自检: signal=%s mode=%s %.2fs 录音 %d 字节（峰值 %d）→ %s",
+            signal, mode, seconds, len(recorded), _debug_peak(recorded), path,
+        )
+        return {
+            "ok": True,
+            "signal": signal,
+            "mode": mode,
+            "tone_hz": tone_hz,
+            "level": level,
+            "wav": str(path),
+            "recorded_bytes": len(recorded),
+            "recorded_seconds": round(len(recorded) / 2 / 16000, 2),
+            "peak": _debug_peak(recorded),
+        }
+
+    # ---------------------------------------------------------------- #
     # 控制台
     # ---------------------------------------------------------------- #
     @app.get("/", response_class=HTMLResponse)
@@ -1486,6 +1669,7 @@ const LABELS = {
   "speech.tts_provider": ["合成 (TTS)", "mock = 离线提示音"],
   "speech.tts_api_key":  ["合成 Key", "留空 = 保持原值"],
   "speech.tts_voice":    ["发音人", "如 alloy / nova"],
+  "speech.tts_stream_playback": ["流式下发播报", "true=边合成边播（延迟低）；false=整段下发（默认，音频更干净）"],
   "behavior.max_linear_mps":     ["限速 线速度", "米/秒，会与设备上限取较小值"],
   "behavior.max_angular_rps":    ["限速 角速度", "弧度/秒"],
   "behavior.max_duration_ms":    ["单次最长运动", "毫秒，防止一直往前冲"],

@@ -75,8 +75,11 @@ import asyncio
 import io
 import logging
 import math
+import queue
+import threading
 import time
 import wave
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -84,7 +87,7 @@ import numpy as np
 import soundfile as sf
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 from scipy.signal import resample_poly
 
@@ -159,6 +162,28 @@ DEFAULT_VOICE = _INITIAL_VOICE
 #: 实测在蓝牙耳机上偏轻、听不清，所以统一拉到这里再送出去。
 TARGET_PEAK = 0.95
 
+#: 增益上限。静音/极轻的块峰值很小，不设上限会把底噪一起放大。
+STREAM_MAX_GAIN = 8.0
+
+#: 相邻两块之间允许的增益**上升**倍率。
+#:
+#: 增益的规则是"降可以立刻降、升只能慢慢升"：
+#:   * 立刻降 —— 保证任何一块都不会削顶（削顶就是听感上的"滋滋"）；
+#:   * 慢慢升 —— 避免一块一块忽大忽小（听起来像在抽气）。
+#:
+#: 为什么不是"整句一个增益"：实测同一句话的峰值能从 20000 涨到 32767，
+#: 用开头估的固定增益会在后半句削顶。sherpa 的块约 1.5 秒，按块算
+#: 既跟得上响度变化，又不会碎到影响听感。
+STREAM_GAIN_RISE = 1.5
+
+#: 增益变化时的过渡时长（秒）。
+#:
+#: 为什么必须过渡：增益只要**突变**，波形上就出现一个台阶 —— 听感就是
+#: "咔"的一声。整段合成只有一个增益不会有这问题；流式是一块一块来的，
+#: 每块各算增益就会在块边界留下台阶。10ms 的线性斜坡足以消掉它，
+#: 又短到听不出音量渐变。
+STREAM_GAIN_RAMP_S = 0.010
+
 #: 送出去的采样率。板子 I2S 固定 16kHz，而 Kokoro 出 24kHz。
 #: **必须在这里重采样，不能交给固件做**：固件的 ``resample_s16_mono``
 #: 是线性插值、没有抗混叠滤波，24k→16k 会把 8kHz 以上的成分折叠回来，
@@ -181,6 +206,21 @@ class SpeechRequest(BaseModel):
     rate: str | None = None
     volume: str | None = None
     pitch: str | None = None
+
+
+class StreamSpeechRequest(BaseModel):
+    """`/v1/audio/speech/stream` 的请求体。
+
+    不含 ``response_format``：流式端点**永远**返回裸 PCM
+    （16kHz / 16bit / 单声道 little-endian），采样率由 ``sample_rate`` 指定。
+    板子的 I2S 就是这个格式，PC 端拿到可以直接往板子推，不需要再解码。
+    """
+
+    model: str = "sherpa"
+    input: str = Field(..., description="要合成的文本")  # noqa: A003 - 沿用 OpenAI
+    voice: str = _INITIAL_VOICE
+    speed: float | None = None
+    sample_rate: int = OUTPUT_RATE
 
 
 def _resample_to_output(data: np.ndarray, rate: int) -> tuple[np.ndarray, int]:
@@ -230,6 +270,42 @@ def pcm_to_wav(samples: np.ndarray, rate: int) -> tuple[bytes, int, float]:
 
     pcm = (np.clip(data, -1.0, 1.0) * 32767.0).astype(np.int16)
     return _encode_wav(pcm, rate)
+
+
+def to_pcm16_bytes(samples: np.ndarray, gain: float = 1.0) -> bytes:
+    """float32 [-1, 1] 单声道 → **裸 16bit little-endian PCM 字节**。
+
+    流式接口用裸 PCM 而不是 WAV：WAV 的 44 字节头必须写在最前面，
+    但流式合成在写完头之前并不知道总长度，也没必要让客户端再剥一层容器。
+    """
+    data = np.asarray(samples, dtype=np.float32).reshape(-1)
+    scaled = np.clip(data * float(gain), -1.0, 1.0)
+    return (scaled * 32767.0).astype(np.int16).tobytes()
+
+
+def to_pcm16_bytes_ramped(
+    samples: np.ndarray, prev_gain: float | None, gain: float, ramp_n: int
+) -> bytes:
+    """同上，但增益从 ``prev_gain`` **线性过渡**到 ``gain``（见 STREAM_GAIN_RAMP_S）。
+
+    ``prev_gain is None`` 表示这是本段的开头：用一小段淡入（0 → gain）
+    代替硬起头 —— 上一段若被强行打断，硬起头会"啪"一声。
+    """
+    data = np.asarray(samples, dtype=np.float32).reshape(-1)
+    n = min(max(1, ramp_n), data.size)
+
+    if prev_gain is None:
+        env = np.ones(data.size, dtype=np.float32)
+        env[:n] = np.linspace(0.0, 1.0, n, dtype=np.float32)
+        scaled = data * (float(gain) * env)
+    elif abs(prev_gain - gain) > 1e-6:
+        env = np.full(data.size, float(gain), dtype=np.float32)
+        env[:n] = np.linspace(float(prev_gain), float(gain), n, dtype=np.float32)
+        scaled = data * env
+    else:
+        scaled = data * float(gain)
+
+    return (np.clip(scaled, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
 
 
 def mp3_to_wav(mp3: bytes) -> tuple[bytes, int, float]:
@@ -432,6 +508,91 @@ class SherpaEngine:
         return _encode_wav(pcm, rate)
 
 
+    def stream(
+        self,
+        text: str,
+        voice: str,
+        speed: float,
+        *,
+        queue_size: int = 8,
+        stop_event: threading.Event | None = None,
+    ) -> Iterator[bytes]:
+        """流式合成：**边生成边** yield 裸 16bit 单声道 PCM（16kHz）。
+
+        原理：sherpa-onnx 的 ``OfflineTts.generate()`` 支持一个
+        ``callback(samples, progress)``，生成过程中会**分块**回调。
+        这里把它接到一个有界队列上，主线程负责取块 + 加增益 + 转 int16。
+
+        与 ``synthesize()`` 的区别就是首字延迟：整段合成要等全部算完
+        （几秒），这里第一块几百毫秒就能送出去。
+
+        增益策略见 ``STREAM_GAIN_RISE``：按块算增益，**降立刻降、升慢慢升**。
+        硬约束是"任何一块都不削顶"—— 削顶在听感上就是"滋滋"的失真。
+        """
+        self.load()
+        if self._tts is None:
+            raise RuntimeError(self._load_error or "sherpa 未就绪")
+
+        sid = min(max(self.resolve_sid(voice), 0), self._tts.num_speakers - 1)
+        speed = min(2.0, max(0.5, float(speed or 1.0)))
+
+        chunks: queue.Queue = queue.Queue(maxsize=max(2, queue_size))
+
+        def on_chunk(samples: np.ndarray, progress: float) -> int:
+            # 这个回调跑在生成线程里。队列满时 put 会阻塞 —— 这是**有意的**：
+            # 客户端消费不过来时反过来压住生成，避免在内存里堆一大段音频。
+            # 但要用带超时的 put：否则客户端中途断开（消费端不再取块）时
+            # 这个线程会永远卡死在这里，连 stop_event 都看不到。
+            #
+            # ⚠️ 返回值语义与文档相反（sherpa-onnx 1.13.8 实测）：
+            #   * 返回 **非 0** → 继续生成；
+            #   * 返回 **0**   → **提前停止**生成。
+            # 文档写的是"非 0 停止"，照文档写会让整句只出第一块就结束
+            # （实测 8.5 秒的句子只得到 0.9 秒）。下面是实测出来的正确写法。
+            payload = ("audio", np.asarray(samples, dtype=np.float32).reshape(-1).copy())
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    return 0  # 0 = 停止生成
+                try:
+                    chunks.put(payload, timeout=0.2)
+                    return 1  # 非 0 = 继续生成
+                except queue.Full:
+                    continue
+
+        def worker() -> None:
+            try:
+                self._tts.generate(text, sid=sid, speed=speed, callback=on_chunk)
+                chunks.put(("done", None))
+            except BaseException as exc:  # noqa: BLE001 - 原样交给消费端抛
+                chunks.put(("error", exc))
+
+        threading.Thread(target=worker, name="tts-stream", daemon=True).start()
+
+        rate = int(getattr(self._tts, "sample_rate", 0) or OUTPUT_RATE)
+        ramp_n = max(1, int(rate * STREAM_GAIN_RAMP_S))
+        gain: float | None = None
+        applied: float | None = None   # 上一块实际用的增益（用于斜坡）
+
+        while True:
+            kind, payload = chunks.get()
+            if kind == "done":
+                break
+            if kind == "error":
+                raise payload
+
+            data = payload
+            peak = float(np.max(np.abs(data))) if data.size else 0.0
+            if peak > 0.01:
+                want = min(STREAM_MAX_GAIN, TARGET_PEAK / peak)
+                if gain is None or want <= gain:
+                    gain = want          # 首块直接定；需要降就立刻降（防削顶）
+                else:
+                    gain = min(want, gain * STREAM_GAIN_RISE)  # 升只能慢慢升
+            current = gain if gain is not None else 1.0
+            yield to_pcm16_bytes_ramped(data, applied, current, ramp_n)
+            applied = current
+
+
 SHERPA = SherpaEngine()
 
 
@@ -592,6 +753,149 @@ async def speech(req: SpeechRequest) -> Response:
             "X-Sample-Rate": str(rate),
         },
     )
+
+
+def wav_to_pcm16_bytes(wav: bytes) -> bytes:
+    """整段 WAV → 归一化后的裸 PCM16（OUTPUT_RATE，单声道）。
+
+    只有"兜底"路径用得到：sherpa 能真流式，Kokoro/edge 不能 —— 它们
+    整段合成完再一次性转成 PCM 发出去，接口形态保持一致。
+    """
+    with wave.open(io.BytesIO(wav), "rb") as w:
+        frames = w.readframes(w.getnframes())
+        rate = w.getframerate()
+        channels = w.getnchannels()
+        width = w.getsampwidth()
+    if width != 2:
+        raise ValueError(f"只支持 16bit WAV，收到 {width * 8}bit")
+
+    data = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    if channels > 1:
+        data = data.reshape(-1, channels)[:, 0]
+    data, _ = _resample_to_output(data, rate)
+
+    peak = float(np.max(np.abs(data))) if data.size else 0.0
+    gain = min(STREAM_MAX_GAIN, TARGET_PEAK / peak) if peak > 0.01 else 1.0
+    return to_pcm16_bytes(data, gain)
+
+
+async def synthesize_full_pcm16(
+    text: str, engine: str, voice: str, speed: float
+) -> bytes:
+    """非流式兜底：整段合成 → 裸 PCM16。"""
+    errors: list[str] = []
+
+    if engine != "edge":
+        order = ("sherpa", "kokoro") if engine != "kokoro" else ("kokoro", "sherpa")
+        for name in order:
+            fn = SHERPA.synthesize if name == "sherpa" else KOKORO.synthesize
+            try:
+                wav, _rate, _dur = await asyncio.to_thread(fn, text, voice, speed)
+                return wav_to_pcm16_bytes(wav)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{name}: {type(exc).__name__}: {exc}")
+
+    try:
+        mp3 = await edge_synthesize(text, voice, None, None, None)
+        wav, _rate, _dur = mp3_to_wav(mp3)
+        return wav_to_pcm16_bytes(wav)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"edge-tts: {type(exc).__name__}: {exc}")
+
+    raise HTTPException(status_code=502, detail="合成失败: " + " | ".join(errors))
+
+
+@app.post("/v1/audio/speech/stream")
+async def speech_stream(req: StreamSpeechRequest) -> StreamingResponse:
+    """流式语音合成：**边合成边下发**裸 PCM（16kHz / 16bit / 单声道 LE）。
+
+    与 `/v1/audio/speech` 的区别：
+
+    * 后者等整句算完才返回，首字延迟 = 整句合成时间；
+    * 这里 sherpa-onnx 每生成一小块就立刻推出去，首块通常几百毫秒，
+      而且**不与文本长度线性相关**——长句也能很快开口。
+
+    客户端把收到的字节直接喂给板子的 ``audio_stream_write`` 即可，
+    不需要解码容器、也不需要重采样。
+    """
+    text = (req.input or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="input 不能为空")
+
+    engine = req.model.lower()
+    if engine not in ("kokoro", "sherpa", "edge"):
+        engine = ENGINE
+
+    # sherpa 是唯一支持真流式的引擎；其余引擎整段合成后一次性发出，
+    # 保持接口一致（客户端不用区分）。
+    if engine == "sherpa" and SHERPA.files_ready:
+        stop_event = threading.Event()
+        iterator = SHERPA.stream(text, req.voice, req.speed or 1.0, stop_event=stop_event)
+
+        def _pull_next():
+            # 生成是阻塞的 torch 推理，必须放到线程里，否则会卡住事件循环
+            # （注意是普通函数：asyncio.to_thread 只接受同步可调用对象）
+            try:
+                return next(iterator)
+            except StopIteration:
+                return _STREAM_DONE
+            except BaseException as exc:  # noqa: BLE001 - 原样抛给客户端
+                return exc
+
+        async def _gen():
+            t0 = time.perf_counter()
+            total = 0
+            first = True
+            try:
+                while True:
+                    item = await asyncio.to_thread(_pull_next)
+                    if item is _STREAM_DONE:
+                        break
+                    if isinstance(item, BaseException):
+                        raise item
+                    total += len(item)
+                    if first:
+                        first = False
+                        logger.info(
+                            "流式合成[首块]: %d 字 -> %.0fms 出第一块（%d 字节）| %r",
+                            len(text), (time.perf_counter() - t0) * 1000, len(item), text[:30],
+                        )
+                    yield item
+            finally:
+                # 客户端中途断开时，消费端不再取块 —— 必须让生成线程停下来
+                stop_event.set()
+                logger.info(
+                    "流式合成完成: %d 字 -> %d 字节 / %.2fs 音频 | 总耗时 %.0fms",
+                    len(text), total, total / 2 / OUTPUT_RATE,
+                    (time.perf_counter() - t0) * 1000,
+                )
+
+        return StreamingResponse(
+            _gen(),
+            media_type="audio/L16",
+            headers={
+                "X-TTS-Engine": "sherpa-stream",
+                "X-Sample-Rate": str(OUTPUT_RATE),
+                "X-Channels": "1",
+                "X-Sample-Format": "s16le",
+            },
+        )
+
+    pcm = await synthesize_full_pcm16(text, engine, req.voice, req.speed or 1.0)
+    logger.info("流式合成[兜底整段]: %d 字 -> %d 字节（engine=%s）", len(text), len(pcm), engine)
+    return StreamingResponse(
+        iter((pcm,)),
+        media_type="audio/L16",
+        headers={
+            "X-TTS-Engine": f"{engine}-whole",
+            "X-Sample-Rate": str(OUTPUT_RATE),
+            "X-Channels": "1",
+            "X-Sample-Format": "s16le",
+        },
+    )
+
+
+_STREAM_DONE = object()
 
 
 def main() -> int:

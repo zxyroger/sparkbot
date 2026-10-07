@@ -283,6 +283,21 @@ class SparkBotRuntime:
                     if envelope.raw.get("event") not in triggers:
                         continue
 
+                    # 回声自触发保护：设备就在喇叭旁边，它**听得见自己说话**。
+                    # 播报期间若再响一次唤醒词，这里就会开新一轮采集，
+                    # 而新一轮的 audio_stream_begin 会把正在播的语音**硬切掉**
+                    # 再插进新的一段 —— 用户听到的就是断续/杂音。
+                    #
+                    # agent 的锁在整个回合（含播报收尾）期间是持有的，
+                    # 所以"锁住 = 这一轮还没说完"，直接忽略这次唤醒即可。
+                    agent = self.agents.all().get(envelope.device_id)
+                    if agent is not None and agent.busy:
+                        logger.info(
+                            "设备 %s 正在说话/思考，忽略这次唤醒（回声自触发）",
+                            envelope.device_id,
+                        )
+                        continue
+
                     await self._handle_voice_turn(envelope.device_id)
                 except asyncio.CancelledError:
                     logger.info("语音闭环已停止")
@@ -332,17 +347,47 @@ class SparkBotRuntime:
             with contextlib.suppress(SparkBotError):
                 await robot.play_tone(frequency_hz=880.0, duration_ms=90)
 
+        rate = self.settings.speech.input_sample_rate
+
+        # ---- 流式识别会话（能用就用，用不了自动回退整段识别） -------------- #
+        # 为什么要在这里就开：采集是"边收边推"的，识别必须**同时**进行，
+        # 等采集完再连就晚了一步。partial 文本会实时发到事件总线，
+        # 控制台因此能边听边出字。
+        session = None
+        if self.asr is not None and getattr(self.asr, "supports_streaming", False):
+            try:
+                session = await self.asr.open_stream(
+                    sample_rate=rate,
+                    on_partial=lambda text: self.bus.publish(
+                        "speech.partial", device_id=robot.device_id, text=text
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 - 服务端没流式端点时回退
+                logger.warning("流式识别不可用，回退到整段识别: %s", exc)
+                session = None
+
         try:
             pcm = await robot.collect_audio(
                 max_seconds=max(3.0, self.settings.speech.listen_timeout_s + 4.0),
                 silence_timeout_s=self.settings.speech.listen_timeout_s,
+                on_chunk=session.push if session is not None else None,
             )
         except SparkBotError as exc:
+            if session is not None:
+                await session.aclose()
             result["error"] = f"采集音频失败: {exc.message}"
             logger.warning(result["error"])
             return result
 
-        rate = self.settings.speech.input_sample_rate
+        streamed_text = ""
+        if session is not None:
+            try:
+                streamed_text = await session.finish()
+            except ProviderError as exc:
+                logger.warning("流式识别收尾失败，回退整段识别: %s", exc.message)
+            finally:
+                await session.aclose()
+
         result["pcm_bytes"] = len(pcm)
         result["recorded_s"] = round(len(pcm) / (rate * 2), 2)
         result["stage"] = "recorded"
@@ -376,7 +421,22 @@ class SparkBotRuntime:
             return result
 
         try:
-            text, turn = await self.transcribe_and_chat(pcm, device_id=robot.device_id, sample_rate=rate)
+            if streamed_text.strip():
+                # 流式链路已经出文本：不再重复识别，直接进对话。
+                # 这就是流式识别的收益 —— 话一说完就有文本，省掉整段识别的往返。
+                text = streamed_text
+                turn = await self.chat(text, device_id=robot.device_id, announce=True)
+                self.bus.publish(
+                    "speech.transcribed",
+                    device_id=robot.device_id,
+                    text=text,
+                    duration_s=round(len(pcm) / (rate * 2), 2),
+                    streamed=True,
+                )
+            else:
+                text, turn = await self.transcribe_and_chat(
+                    pcm, device_id=robot.device_id, sample_rate=rate
+                )
         except ProviderError as exc:
             result["error"] = f"语音识别失败: {exc.message}"
             logger.warning(result["error"])
@@ -562,7 +622,12 @@ class SparkBotRuntime:
                 [_Message.user("请只回复两个字：收到")],
                 tools=None,
                 temperature=0.0,
-                max_tokens=16,
+                # 给足预算：deepseek-flash 是**推理模型**，会先输出
+                # reasoning_content，再输出正文。上限给到 32 时预算会被
+                # 推理吃光（finish_reason=length，content 为空串），
+                # 控制台的「测试连接」就变成"连通成功但回复为空"，像坏了。
+                # 256 对"收到"两个字绰绰有余，成本可忽略。
+                max_tokens=256,
             )
         except ProviderError as exc:
             return {

@@ -68,9 +68,15 @@ static const char *TAG = "bot_audio";
 #define PLAY_RING_BYTES (64 * 1024)
 
 /* I2S DMA 描述符数量与每帧采样数。
- * 采样数取小一点让 DMA 更"碎"，降低采集延迟；描述符多几个保证不断流。 */
-#define I2S_DMA_DESC_NUM 6
-#define I2S_DMA_FRAME_NUM 240
+ * 采样数取小一点让 DMA 更"碎"，降低采集延迟；描述符多几个保证不断流。
+ *
+ * 2026-10 实测：6 × 240 = 1440 采样 ≈ **90ms** 的缓冲太浅。设备同时在做
+ * "播放 + 常开麦克风 + 唤醒引擎 + WiFi"时，播放任务偶尔被挤到 100ms 级，
+ * DMA 一空就丢样本 —— 表现是"说到一半滋滋"。
+ * 改成 8 × 480 = 3840 采样 ≈ **240ms**，给调度留出余量。
+ * 代价：TX+RX 各多占约 8KB DMA 内存，采集延迟增加几十毫秒（可接受）。 */
+#define I2S_DMA_DESC_NUM 8
+#define I2S_DMA_FRAME_NUM 480
 
 /* 采集任务栈大小。见文件头说明 3 —— 4096 会 stack overflow。 */
 #define CAPTURE_TASK_STACK 8192
@@ -98,7 +104,25 @@ static const char *TAG = "bot_audio";
  * 导致堆损坏（这类崩溃往往在很久之后才暴露，极难定位）。
  */
 #define CAPTURE_TASK_NAME "bot_mic"
-#define CAPTURE_TASK_PRIO 4
+/*
+ * 采集任务优先级 4 → 6。
+ *
+ * 实测证据：唤醒引擎的喂帧速率只有 **20.8 帧/秒**，而 16kHz / 512 采样
+ * 应该是 31.25 帧/秒 —— 也就是麦克风这条路上丢了约 1/3 的音频。
+ * 原因是采集任务(4)低于唤醒引擎任务 bot_afe(5)，被抢了 CPU 后 I2S RX
+ * DMA 溢出。后果是唤醒词时灵时不灵、识别质量下降。
+ * 提到 6（高于 bot_afe）后采集不再被挤。
+ */
+#define CAPTURE_TASK_PRIO 6
+
+/*
+ * 播放任务优先级。
+ *
+ * 必须**高于**唤醒引擎(5) 和采集(6)：播放只要被延迟 200ms 以上，
+ * I2S TX DMA 就会空，听感上就是断音/滋滋。播放任务本身每次只跑
+ * 几毫秒（把数据搬进 DMA），抬高不会饿死别的任务。
+ */
+#define PLAY_TASK_PRIO 7
 #define CAPTURE_TASK_CAPS MALLOC_CAP_SPIRAM
 
 typedef struct {
@@ -136,6 +160,15 @@ typedef struct {
     RingbufHandle_t play_rb;
     volatile bool playing;
     volatile bool stop_requested;
+    /*
+     * 流式播放中（见 bot_audio_stream_begin/write/end）。
+     *
+     * 与普通播放的关键差别：流式期间环形缓冲**短暂空掉不算播完** ——
+     * 那只是 PC 还没把下一块数据推过来。只有 bot_audio_stream_end() 之后
+     * 缓冲真正排空，才算这一轮说完。没有这个标志的话，边收边播会在每块
+     * 数据之间被误判成"播放结束"，audio_done 会连发好几次。
+     */
+    volatile bool stream_active;
 
     int volume;
     int sample_rate;
@@ -376,8 +409,17 @@ static void play_task(void *arg)
 {
     ESP_LOGI(TAG, "播放任务启动");
 
-    /* 空闲时先静音，避免底噪；有数据时再解除 */
-    esp_codec_dev_set_out_mute(s_a.codec, true);
+    /*
+     * ⚠️ 这里**故意不再切换 codec 的输出静音位**。
+     *
+     * 原来空闲时 mute、有数据时 unmute，看起来省电又安静，但实测每次
+     * 切换都会在喇叭上留一记爆音：录音波形里能看到紧贴播放开始/结束的
+     * **单样本满幅尖峰**（±22000，是音量的 6 倍）。用户听到的就是
+     * "说一半滋滋" —— 连续几句播报时每一句的首尾各响一下。
+     *
+     * 空闲时的底噪改用 I2S 的 auto_clear（DMA 自动补 0）解决，
+     * 那本来就是无声的，不需要动 DAC 的静音位。
+     */
     esp_codec_dev_set_out_vol(s_a.codec, s_a.volume);
 
     while (true) {
@@ -385,10 +427,10 @@ static void play_task(void *arg)
         /* 阻塞等数据；超时后回到循环检查退出条件 */
         uint8_t *chunk = xRingbufferReceiveUpTo(s_a.play_rb, &got, pdMS_TO_TICKS(100), 4096);
         if (chunk == NULL) {
-            /* 没数据。如果之前正在播，说明播完了。 */
-            if (s_a.playing) {
+            /* 没数据。如果之前正在播、且**不在流式模式**，说明播完了。
+             * 流式模式下缓冲空只是"还没收到下一块"，不能算结束。 */
+            if (s_a.playing && !s_a.stream_active) {
                 s_a.playing = false;
-                esp_codec_dev_set_out_mute(s_a.codec, true);
                 ESP_LOGI(TAG, "播放结束");
                 if (s_a.done_cb != NULL) {
                     s_a.done_cb();
@@ -398,19 +440,6 @@ static void play_task(void *arg)
         }
 
         s_a.playing = true;
-        esp_codec_dev_set_out_mute(s_a.codec, false);
-
-        if (s_a.stop_requested) {
-            vRingbufferReturnItem(s_a.play_rb, chunk);
-            /* 把缓冲里剩下的也倒掉 */
-            while ((chunk = xRingbufferReceiveUpTo(s_a.play_rb, &got, 0, 4096)) != NULL) {
-                vRingbufferReturnItem(s_a.play_rb, chunk);
-            }
-            s_a.stop_requested = false;
-            s_a.playing = false;
-            esp_codec_dev_set_out_mute(s_a.codec, true);
-            continue;
-        }
 
         /* 数据在推入缓冲前已由 bot_audio_play() 重采样到板子采样率，
          * 所以这里直接写即可。 */
@@ -577,8 +606,9 @@ esp_err_t bot_audio_init(void)
     }
     esp_codec_dev_set_out_vol(s_a.codec, s_a.volume);
     esp_codec_dev_set_in_gain(s_a.codec, (float)CONFIG_SPARKBOT_AUDIO_MIC_GAIN_DB);
-    /* 空闲时两个方向都静音，避免底噪，也避免误采 */
-    esp_codec_dev_set_out_mute(s_a.codec, true);
+    /* 输入空闲时静音（避免误采）；**输出不静音** —— 见 play_task 的说明，
+     * 切换输出静音位会在喇叭上留爆音，空闲无声靠 I2S auto_clear 补 0。 */
+    esp_codec_dev_set_out_mute(s_a.codec, false);
     esp_codec_dev_set_in_mute(s_a.codec, true);
 
     /* ---- 播放环形缓冲与任务 ---- */
@@ -587,7 +617,7 @@ esp_err_t bot_audio_init(void)
         ESP_LOGE(TAG, "播放缓冲创建失败");
         return ESP_ERR_NO_MEM;
     }
-    if (xTaskCreate(play_task, "bot_spk", 4096, NULL, 5, &s_a.play_task) != pdPASS) {
+    if (xTaskCreate(play_task, "bot_spk", 4096, NULL, PLAY_TASK_PRIO, &s_a.play_task) != pdPASS) {
         ESP_LOGE(TAG, "创建播放任务失败");
         return ESP_FAIL;
     }
@@ -723,6 +753,75 @@ esp_err_t bot_audio_play_raw_i16(const int16_t *samples, size_t count)
     return ESP_OK;
 }
 
+/* ------------------------------------------------------------------ */
+/* 流式播放                                                           */
+/*                                                                    */
+/* 与 bot_audio_play() 的区别：play 是"整段替换"（先停掉正在播的，再播  */
+/* 新的），而流式是"边收边播、段落之间不断流"——PC 把一段长文本按句合成， */
+/* 一块块推过来，板子接着往下播，中间不打断、不留空隙。                */
+/*                                                                    */
+/* 用法（PC 侧）：stream_begin → stream_write × N → stream_end。       */
+/* 数据必须是**板子采样率**（16kHz）单声道 16bit 裸 PCM，不做重采样。   */
+/* ------------------------------------------------------------------ */
+
+esp_err_t bot_audio_stream_begin(void)
+{
+    if (!s_a.ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* 打断上一段（比如上一轮播报还没说完） */
+    bot_audio_stop_playback();
+
+    /*
+     * 等播放任务真正停下来、并把缓冲倒空再进入流式模式。
+     *
+     * 播放任务是异步停的：bot_audio_stop_playback() 只置标志，它每 100ms
+     * 醒一次才处理。如果不等就置 stream_active，紧接着写入的新数据会被
+     * 那次"倒空缓冲"一起丢掉，表现为开头一小段没声音。
+     */
+    for (int i = 0; i < 40; i++) {
+        /* 留 512 字节余量：字节型 ring buffer 的"最大空闲"通常比标称容量
+         * 少几个字节，写死 >= PLAY_RING_BYTES 会永远不成立，白白等满 400ms。 */
+        if (!s_a.playing &&
+            xRingbufferGetCurFreeSize(s_a.play_rb) + 512 >= PLAY_RING_BYTES) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    s_a.stream_active = true;
+    return ESP_OK;
+}
+
+esp_err_t bot_audio_stream_write(const int16_t *samples, size_t count)
+{
+    if (!s_a.ready || !s_a.stream_active || samples == NULL || count == 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* 复用普通播放的入队逻辑：缓冲满时会等播放任务消费（背压） */
+    return bot_audio_play_raw_i16(samples, count);
+}
+
+esp_err_t bot_audio_stream_end(void)
+{
+    if (!s_a.ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_a.stream_active = false;
+    /*
+     * 不必主动补发 audio_done：播放任务每个 100ms 周期都会检查一次
+     * "缓冲空了且不在流式模式"，届时会自己发。这里立刻返回，让 PC 能
+     * 尽快去处理别的事。
+     */
+    return ESP_OK;
+}
+
+bool bot_audio_stream_active(void)
+{
+    return s_a.stream_active;
+}
+
 esp_err_t bot_audio_play(const uint8_t *data, size_t len, bool is_wav, int sample_rate)
 {
     if (!s_a.ready || data == NULL || len == 0) {
@@ -746,6 +845,7 @@ esp_err_t bot_audio_play(const uint8_t *data, size_t len, bool is_wav, int sampl
     }
 
     /* 先停掉正在播的内容：新语音应该打断旧的，而不是排队等 */
+    s_a.stream_active = false; /* 整段播放会打断正在进行的流式播报 */
     bot_audio_stop_playback();
 
     /* 重采样到板子的采样率 */
@@ -773,16 +873,25 @@ void bot_audio_stop_playback(void)
         return;
     }
     /*
-     * 只要缓冲区里还有数据或正在播，就请求停止。
-     * 播放任务看到标志后会把缓冲倒空。
+     * **立即把播放缓冲倒空**（同步完成，不留给播放任务）。
      *
-     * 注意这里**不直接 mute**：如果立刻静音，正在写 I2S 的那一小段
-     * 会被硬切掉，听感上是一个明显的"咔"。让播放任务自己清空缓冲、
-     * 在循环末尾静音，过渡更自然。
+     * 为什么不能像原来那样"只置一个标志、等播放任务自己倒空"：
+     * 标志只在播放任务**收到一块数据**时才会被清除。若置位时缓冲已空，
+     * 播放任务下一次醒来拿到的是 NULL（没有数据），标志就一直留着 ——
+     * 等**下一遍播放**的第一块数据进来，播放任务看到这个陈旧标志，
+     * 会把那一块连同缓冲里已有的内容一起丢掉（倒空）。
+     * 实测表现就是"第一遍正常、**第二遍开头缺一段并伴随一声咔**"。
+     *
+     * 倒空是线程安全的（ring buffer 自带锁），但播放任务手里可能正握着
+     * 一块（最多 128ms）在写 I2S —— 那一小段会放完，这是可以接受的，
+     * 比硬切静音自然。
      */
-    if (s_a.playing || xRingbufferGetCurFreeSize(s_a.play_rb) < PLAY_RING_BYTES) {
-        s_a.stop_requested = true;
+    uint8_t *item = NULL;
+    size_t got = 0;
+    while ((item = xRingbufferReceiveUpTo(s_a.play_rb, &got, 0, 4096)) != NULL) {
+        vRingbufferReturnItem(s_a.play_rb, item);
     }
+    s_a.stop_requested = false;
 }
 
 bool bot_audio_playing(void)

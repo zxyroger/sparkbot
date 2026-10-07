@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 import time
@@ -160,6 +161,71 @@ def infer_emotion(text: str) -> Emotion | None:
     return None
 
 
+#: 播报分段用的句末标点（中英文都算）。
+_SENTENCE_RE = re.compile(r"[^。！？!?；;\n]*[。！？!?；;\n]+|[^。！？!?；;\n]+")
+
+#: 上面的规则还切不开时，再按这些"停顿感稍弱"的标点切。
+_CLAUSE_RE = re.compile(r"[^，,、：:]*[，,、：:]+|[^，,、：:]+")
+
+#: 单个播报段落的字符上限。
+#: 依据是硬限制而非口味：单条 WebSocket 消息约 708KB ≈ 22 秒 ≈ 95 字，
+#: 超过就整段发不出去。取 60 字（≈ 14 秒 ≈ 450KB）留足余量，
+#: 让"停顿"落在标点上，听感自然。
+MAX_SPEECH_SEGMENT_CHARS = 60
+
+#: 流式播报每块 PCM 的字节数（4096 = 2048 采样 = 128ms 音频）。
+#: 太小会让命令往返次数暴增，太大则首块延迟变大、单条消息也更大。
+STREAM_CHUNK_BYTES = 4096
+
+#: 流式播报要求的采样率 —— 固件就是按 16kHz 播的，不做重采样。
+STREAM_SAMPLE_RATE = 16000
+
+
+def split_for_speech(
+    text: str, *, max_chars: int = MAX_SPEECH_SEGMENT_CHARS
+) -> list[str]:
+    """把回复切成适合逐段播报的片段。
+
+    为什么需要分段：单条 WebSocket 消息有长度上限（约 22 秒 / 95 字音频），
+    超出时 PC 端会直接拒发 —— 现象就是"短句有声、背古诗整段没声"。
+    切开以后每段都远小于上限；附带好处是第一段合成完就能开口，
+    不用等整篇合成完。
+
+    切分优先级：句末标点 → 逗号类标点 → 硬切（保证任何输入都不会超限）。
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    segments: list[str] = []
+    for sentence in _SENTENCE_RE.findall(text):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if len(sentence) <= max_chars:
+            segments.append(sentence)
+            continue
+
+        # 句子太长：按逗号类标点二次切分
+        buffer = ""
+        for clause in _CLAUSE_RE.findall(sentence):
+            if len(buffer) + len(clause) <= max_chars:
+                buffer += clause
+                continue
+            if buffer.strip():
+                segments.append(buffer.strip())
+            buffer = ""
+            # 单条 clause 仍然超限（没有标点的长串）：硬切
+            while len(clause) > max_chars:
+                segments.append(clause[:max_chars])
+                clause = clause[max_chars:]
+            buffer = clause
+        if buffer.strip():
+            segments.append(buffer.strip())
+
+    return segments
+
+
 # --------------------------------------------------------------------------- #
 # Agent
 # --------------------------------------------------------------------------- #
@@ -207,6 +273,19 @@ class Agent:
             self.ctx.long_term = self.long_term
         self._lock = asyncio.Lock()
         """串行化同一台机器人的对话，避免两轮对话抢同一个底盘。"""
+
+    @property
+    def busy(self) -> bool:
+        """这一轮是否还没结束（含"播报收尾"）。
+
+        语音闭环用它做**回声自触发保护**：设备就贴在喇叭旁边，播报时它
+        听得见自己；如果这时又响一次唤醒词就开新一轮采集，新的一轮会把
+        正在播的语音硬切掉，听感就是断续/杂音。
+
+        ``run()`` 全程持有 ``_lock``（包括 ``_express`` 里等设备播完），
+        所以"锁被占用"就等于"还没说完"，语义正好。
+        """
+        return self._lock.locked()
 
     # ------------------------------------------------------------------ #
     # 提示词
@@ -574,25 +653,171 @@ class Agent:
         #   * 有"下发完成"但仍无声          → 设备侧播放/喇叭问题
         # 没有它们时，"play_audio 从未到达设备"到底是没合成还是没发送，
         # 只能靠猜。
-        logger.info("播报开始: 合成 %d 字（设备=%s）", len(turn.reply), robot.device_id)
-        try:
-            t0 = time.monotonic()
-            audio, fmt = await self.ctx.tts.synthesize(turn.reply)
-            synth_ms = (time.monotonic() - t0) * 1000
-            logger.info("播报: 合成完成 %d 字节 fmt=%s 耗时=%.0fms",
-                        len(audio), fmt, synth_ms)
-            if not audio:
-                logger.warning("播报跳过: TTS 返回空音频")
-                return
+        # 长回复必须分段下发：单条 WebSocket 消息有长度上限
+        # （约 22 秒 / 95 字音频），超了 PC 端会直接拒发，现象就是
+        # "短句有声、背古诗整段没声"。分段后每段都远小于上限。
+        segments = split_for_speech(turn.reply)
+        if not segments:
+            logger.warning("播报跳过: 文本切不出可播报的片段")
+            return
 
-            t1 = time.monotonic()
-            await robot.say(audio, fmt=fmt)
-            logger.info("播报: 下发完成 耗时=%.0fms（设备已接收）",
-                        (time.monotonic() - t1) * 1000)
+        logger.info("播报开始: %d 字 → %d 段（设备=%s）",
+                    len(turn.reply), len(segments), robot.device_id)
+        try:
+            # 走哪条下发路径由配置决定（见 speech.tts_stream_playback）：
+            #   * 默认整段下发 —— 老路径，实测音频最干净；
+            #   * 打开开关才走流式下发 —— 首字延迟低，但在本板上有可闻杂音。
+            if (
+                self.settings.speech.tts_stream_playback
+                and getattr(self.ctx.tts, "supports_streaming", False)
+            ):
+                await self._speak_segments(robot, segments, full_text=turn.reply.strip())
+            elif len(segments) == 1:
+                await self._speak_segment(robot, segments[0])
+            else:
+                await self._speak_segments(robot, segments)
         except SparkBotError as exc:
             logger.warning("播报失败: %s", exc.message)
         except Exception as exc:  # noqa: BLE001 - 这里出错不该让对话失败
             logger.exception("播报异常: %s", exc)
+
+    async def _speak_segment(self, robot: Robot, text: str, *, wait: bool = False) -> None:
+        """合成一段并下发；``wait=True`` 时等到设备真的播完再返回。"""
+        t0 = time.monotonic()
+        audio, fmt = await self.ctx.tts.synthesize(text)
+        logger.info("播报: 合成完成 %d 字节 fmt=%s 耗时=%.0fms（%d 字）",
+                    len(audio), fmt, (time.monotonic() - t0) * 1000, len(text))
+        if not audio:
+            logger.warning("播报跳过: 该段 TTS 返回空音频（%r）", text[:20])
+            return
+
+        t1 = time.monotonic()
+        await robot.say(audio, fmt=fmt, wait=wait)
+        logger.info("播报: 下发完成 耗时=%.0fms（设备已接收%s）",
+                    (time.monotonic() - t1) * 1000, "，已播完" if wait else "")
+
+    async def _speak_segments(
+        self, robot: Robot, segments: list[str], *, full_text: str | None = None
+    ) -> None:
+        """流式播报：优先走**真流式**，设备不支持时回退到逐段下发。
+
+        ``full_text`` 是**未分段**的原文。流式路径用它一次合成整段：
+        分段本来只是老的整段下发为了绕开单条 WebSocket 消息上限（约 22 秒
+        音频）才需要的；流式每块只有几 KB，没有这个限制。而分段会带来一个
+        副作用 —— 每段各自算一次响度增益，**段与段之间音量会跳变**，
+        跳变在波形上就是一个台阶，听感上是"咔"的一声（用户描述为"滋滋"）。
+
+        回退路径（设备不支持流式播放）仍然用 ``segments``，因为它要受
+        单条消息上限约束。
+        """
+        try:
+            await robot.audio_stream_begin()
+        except SparkBotError as exc:
+            logger.warning("设备不支持流式播放（%s），回退为逐段下发", exc.message)
+            await self._speak_segments_sequential(robot, segments)
+            return
+        await self._speak_streaming(
+            robot, full_text or "".join(segments), fallback=segments
+        )
+
+    async def _speak_streaming(
+        self, robot: Robot, text: str, *, fallback: list[str] | None = None
+    ) -> None:
+        """真流式播报：**边合成边下发**，设备边收边播。
+
+        两段流水线叠在一起：
+
+        * 合成侧：``tts.synthesize_stream()`` 每算出一小块就交出来；
+        * 下发侧：立刻 ``audio_stream_write`` 推给设备。
+
+        所以首字延迟 ≈ **第一块**合成时间，而不是整句合成时间（实测
+        8.5 秒的句子：整段 2.9s → 首块 0.55s）。段与段之间不断流，
+        背压由设备 64KB 环形缓冲天然提供。
+        """
+        sent = 0
+        started = time.monotonic()
+        first_audio_ms: float | None = None
+        need_fallback = False
+
+        try:
+            wait_read_ms = 0.0
+            t_read = time.monotonic()
+            async for pcm in self.ctx.tts.synthesize_stream(
+                text, sample_rate=STREAM_SAMPLE_RATE
+            ):
+                # 把"等下一块合成"和"推给设备"分开计时：
+                # 前者大 = TTS 供不上；后者大 = 设备侧环形缓冲满（正常背压）。
+                # 两者都小却有停顿，说明是 PC 自己的事件循环被别的活儿占住了。
+                wait_read_ms = (time.monotonic() - t_read) * 1000
+                if first_audio_ms is None:
+                    first_audio_ms = (time.monotonic() - started) * 1000
+                t_push = time.monotonic()
+                for off in range(0, len(pcm), STREAM_CHUNK_BYTES):
+                    await robot.audio_stream_write(pcm[off:off + STREAM_CHUNK_BYTES])
+                push_ms = (time.monotonic() - t_push) * 1000
+                sent += len(pcm)
+                logger.info(
+                    "播报: 流式推送 %d 字节（累计 %.2fs 音频，等合成 %.0fms，推送 %.0fms）",
+                    len(pcm), sent / 2 / STREAM_SAMPLE_RATE, wait_read_ms, push_ms,
+                )
+                t_read = time.monotonic()
+        except ProviderError as exc:
+            # 服务端没有流式端点、或合成中途失败 → 回退逐段下发。
+            # 已经推出去的部分不会浪费：设备会把它播完，不会静音。
+            logger.warning("流式合成失败（%s），回退为逐段下发", exc.message)
+            need_fallback = True
+        finally:
+            # 无论成功失败都要收尾：否则设备会一直停在流式模式，
+            # 缓冲播空后不发 audio_done，后续"等播完"的时序全乱。
+            with contextlib.suppress(SparkBotError, Exception):
+                await robot.audio_stream_end()
+
+        if need_fallback:
+            await self._speak_segments_sequential(robot, fallback or [text])
+            return
+
+        # 等设备真的播完再返回。不然后续流程（下一轮采集）会在喇叭还在响的
+        # 时候就开麦，设备一边播一边上传音频，主循环被挤住 → 推送出现空档
+        # → 2 秒环形缓冲抽干 → 断流（用户听到的"说一半滋滋"）。
+        done = False
+        with contextlib.suppress(Exception):
+            done = await robot.wait_audio_done(timeout_s=3.0)
+
+        logger.info(
+            "播报: 流式推送完成 %d 字节 / %.2fs 音频，首块=%.0fms，总耗时=%.0fms，播完=%s",
+            sent, sent / 2 / STREAM_SAMPLE_RATE,
+            first_audio_ms if first_audio_ms is not None else -1.0,
+            (time.monotonic() - started) * 1000,
+            done,
+        )
+
+    async def _speak_segments_sequential(self, robot: Robot, segments: list[str]) -> None:
+        """逐段下发（回退路径）：等上一段播完再发下一段。
+
+        固件的 ``play_audio`` 是"新语音打断旧语音"，所以必须等 ``audio_done``；
+        代价是段间有一次网络往返的空隙。设备不支持流式时走这条路。
+        """
+        pending = asyncio.create_task(self.ctx.tts.synthesize(segments[0]))
+        for i in range(len(segments)):
+            audio, fmt = await pending
+            if i + 1 < len(segments):
+                # 预取下一段：它与本段的播放并行
+                pending = asyncio.create_task(self.ctx.tts.synthesize(segments[i + 1]))
+
+            if not audio:
+                logger.warning("播报跳过: 第 %d/%d 段 TTS 返回空音频",
+                               i + 1, len(segments))
+                continue
+
+            last = i + 1 >= len(segments)
+            t0 = time.monotonic()
+            result = await robot.say(audio, fmt=fmt, wait=not last)
+            logger.info(
+                "播报: 第 %d/%d 段 %d 字节，耗时=%.0fms%s",
+                i + 1, len(segments), len(audio), (time.monotonic() - t0) * 1000,
+                "" if last else ("（已播完）" if result.get("done")
+                                 else "（等待超时，按估算时长继续）"),
+            )
 
     # ------------------------------------------------------------------ #
     # 流式（供 Web 控制台使用）

@@ -157,6 +157,10 @@ class Action(str, Enum):
 
     # --- 音频 ---
     PLAY_AUDIO = "play_audio"  # 播放 PC 侧生成的音频（url 或内联 base64）
+    # --- 流式播放：begin → write × N → end，段落之间不断流 ---
+    AUDIO_STREAM_BEGIN = "audio_stream_begin"
+    AUDIO_STREAM_WRITE = "audio_stream_write"  # data_b64 = 16k 单声道 16bit 裸 PCM
+    AUDIO_STREAM_END = "audio_stream_end"
     TTS_SPEAK = "tts_speak"  # 让设备用板载 TTS 说一句（可选能力）
     START_LISTEN = "start_listen"  # 开始采集麦克风并回传 audio 帧
     STOP_LISTEN = "stop_listen"

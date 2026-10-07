@@ -133,6 +133,14 @@ class SpeechSettings(BaseSettings):
     # 云端返回的音频是否缓存到 artifacts/audio。
     cache_audio: bool = True
 
+    #: 播报走"流式下发"（边合成边推、设备边收边播）还是老的"整段下发"。
+    #:
+    #: 默认 **False**：整段下发是老路径，实测音频最干净。
+    #: 流式下发首字延迟更低（0.5s vs 2.9s），但在本板上出现过用户可闻的
+    #: 杂音（播放期间持续收发 + 被打断），所以默认关掉、作为可选实验项。
+    #: 打开：SPARKBOT_SPEECH_TTS_STREAM_PLAYBACK=true
+    tts_stream_playback: bool = False
+
 
 class LongTermMemorySettings(BaseSettings):
     """长期记忆参数（跨会话保留的事实）。"""
@@ -269,6 +277,7 @@ EDITABLE_FIELDS: dict[str, str] = {
     # tts_format 必须是可配的：本地 TTS（如 edge-tts 包装服务）通常只出
     # WAV，而云端 OpenAI 用 mp3 更省流量。写死任一种都会让另一类服务不可用。
     "speech.tts_format": "SPARKBOT_SPEECH_TTS_FORMAT",
+    "speech.tts_stream_playback": "SPARKBOT_SPEECH_TTS_STREAM_PLAYBACK",
     "speech.listen_timeout_s": "SPARKBOT_SPEECH_LISTEN_TIMEOUT_S",
     "behavior.max_linear_mps": "SPARKBOT_BEHAVIOR_MAX_LINEAR_MPS",
     "behavior.max_angular_rps": "SPARKBOT_BEHAVIOR_MAX_ANGULAR_RPS",
@@ -425,4 +434,3 @@ def persist_env(path: str | Path, updates: dict[str, str]) -> int:
     temp_path.write_text("\n".join(output) + "\n", encoding="utf-8")
     os.replace(temp_path, env_path)
     return written
-

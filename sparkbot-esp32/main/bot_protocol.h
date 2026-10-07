@@ -90,6 +90,13 @@ extern "C" {
 #define BOT_ACT_SET_CAMERA_PARAMS   "set_camera_params"
 /* 音频 */
 #define BOT_ACT_PLAY_AUDIO          "play_audio"
+/* 流式播放三件套：begin → write × N → end。
+ * 与 play_audio 的区别是段落之间**不断流**（边收边播），
+ * 适合长文本按句合成后连续推送。write 的 data_b64 是板子采样率的
+ * 单声道 16bit 裸 PCM。 */
+#define BOT_ACT_AUDIO_STREAM_BEGIN  "audio_stream_begin"
+#define BOT_ACT_AUDIO_STREAM_WRITE  "audio_stream_write"
+#define BOT_ACT_AUDIO_STREAM_END    "audio_stream_end"
 #define BOT_ACT_TTS_SPEAK           "tts_speak"
 #define BOT_ACT_PLAY_TONE           "play_tone"
 #define BOT_ACT_SET_VOLUME          "set_volume"
