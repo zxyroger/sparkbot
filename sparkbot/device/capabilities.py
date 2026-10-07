@@ -462,7 +462,11 @@ class Robot:
         )
 
         data = envelope.data
-        scan = FaceScan(width=int(data.get("width") or 0), height=int(data.get("height") or 0))
+        scan = FaceScan(
+            width=int(data.get("width") or 0),
+            height=int(data.get("height") or 0),
+            mean_luma=int(data.get("mean_luma", -1)),
+        )
         for raw in data.get("faces") or []:
             if not isinstance(raw, dict):
                 continue

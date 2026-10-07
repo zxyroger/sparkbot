@@ -86,6 +86,51 @@ static void dims_from_size(framesize_t fs, int *w, int *h)
     }
 }
 
+/*: 真正改了分辨率后，为了等 AEC/AGC 重新收敛而丢掉的帧数。 */
+#define CAM_RESET_DISCARD_FRAMES 6
+
+/*
+ * 只在**分辨率真的变了**时才写 sensor 寄存器；返回 true 表示确实改了。
+ *
+ * 为什么必须挡这一道：OV2640 的 set_framesize() 会重写时序/窗口寄存器，
+ * 副作用是 **AEC/AGC/AWB 全部从头收敛**，之后若干帧都是"没收敛"的状态 ——
+ * 实测在室内光线下表现为**近全黑**（平均亮度 8/255，收敛后是 30~48）。
+ *
+ * 这个坑很隐蔽：`snapshot` 每次抓图都会带上 PC 传来的 width/height，
+ * 于是"抓一张看一眼"这种最普通的用法拿到的全是没收敛的暗帧；
+ * 而推流路径只在开启时设置一次分辨率，帧就一直是亮的 ——
+ * 表现成「预览正常，抓拍 / 识别却什么都看不到」，很难往分辨率上想。
+ */
+static bool apply_framesize_locked(sensor_t *sensor, framesize_t want)
+{
+    if (sensor == NULL) {
+        return false;
+    }
+    int w = 0, h = 0;
+    dims_from_size(want, &w, &h);
+    if (w == s_c.width && h == s_c.height) {
+        return false;   /* 没变：一个寄存器都不碰 */
+    }
+    if (sensor->set_framesize(sensor, want) != 0) {
+        return false;
+    }
+    s_c.width = w;
+    s_c.height = h;
+    return true;
+}
+
+/* 丢若干帧，给 AEC/AGC 留出重新收敛的时间（调用方必须已持锁）。 */
+static void discard_frames(int count)
+{
+    for (int i = 0; i < count; i++) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb != NULL) {
+            esp_camera_fb_return(fb);
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
 /*
  * 扫一遍 I2C 总线并打印有应答的地址。
  *
@@ -352,9 +397,8 @@ esp_err_t bot_camera_snapshot(int width, int height, int quality)
             s_c.quality = quality;
         }
         if (width > 0 && height > 0) {
-            framesize_t want = size_from_dims(width, height);
-            if (sensor->set_framesize(sensor, want) == 0) {
-                dims_from_size(want, &s_c.width, &s_c.height);
+            if (apply_framesize_locked(sensor, size_from_dims(width, height))) {
+                discard_frames(CAM_RESET_DISCARD_FRAMES);
             }
         }
     }
@@ -383,9 +427,9 @@ esp_err_t bot_camera_set_params(int width, int height, int quality)
         s_c.quality = quality;
     }
     if (width > 0 && height > 0) {
-        framesize_t want = size_from_dims(width, height);
-        if (sensor->set_framesize(sensor, want) == 0) {
-            dims_from_size(want, &s_c.width, &s_c.height);
+        /* 同 snapshot：只在真的变了才写，写完丢几帧等 AEC 收敛。 */
+        if (apply_framesize_locked(sensor, size_from_dims(width, height))) {
+            discard_frames(CAM_RESET_DISCARD_FRAMES);
         }
     }
     xSemaphoreGive(s_c.lock);
@@ -418,8 +462,9 @@ esp_err_t bot_camera_set_stream(bool enabled, float fps, int width, int height)
         if (sensor != NULL && (width > 0 || height > 0)) {
             framesize_t want = size_from_dims(width > 0 ? width : 320,
                                               height > 0 ? height : 240);
-            if (sensor->set_framesize(sensor, want) == 0) {
-                dims_from_size(want, &s_c.width, &s_c.height);
+            /* 同一道保护：反复开预览不该每次都把 AEC 打回起点。 */
+            if (apply_framesize_locked(sensor, want)) {
+                discard_frames(CAM_RESET_DISCARD_FRAMES);
             }
         }
         s_c.streaming = true;

@@ -56,13 +56,17 @@ extern "C" bool bot_face_rec_ready(void)
     return s_det != nullptr && s_feat != nullptr;
 }
 
-extern "C" int bot_face_rec_run(const uint8_t *jpeg, size_t len, bot_face_t *out, int max_faces)
+extern "C" int bot_face_rec_run(const uint8_t *jpeg, size_t len, bot_face_t *out, int max_faces,
+                                int *mean_luma)
 {
     if (!bot_face_rec_ready() || jpeg == nullptr || len == 0 || out == nullptr || max_faces <= 0) {
         return -1;
     }
     if (max_faces > BOT_FACE_MAX) {
         max_faces = BOT_FACE_MAX;
+    }
+    if (mean_luma != nullptr) {
+        *mean_luma = -1;
     }
 
     int64_t t0 = esp_timer_get_time();
@@ -101,6 +105,25 @@ extern "C" int bot_face_rec_run(const uint8_t *jpeg, size_t len, bot_face_t *out
     if (derr != ESP_OK || img.data == nullptr) {
         ESP_LOGW(TAG, "JPEG 解码失败（%u 字节，%dx%d）", (unsigned)len, info.width, info.height);
         return -1;
+    }
+
+    /* ---- 1.5 画面亮度（诊断用） ---- *
+     * 每 7 个像素采一个，7 与通道数 3 互质，保证不会只采到同一个通道。
+     * 921600 字节的画面只采 4 万次，耗时可以忽略，但能把
+     * 「没人」和「太黑」这两种"检测到 0 张"区分开。 */
+    int luma = -1;
+    if (mean_luma != nullptr) {
+        const uint8_t *px = (const uint8_t *)img.data;
+        size_t pixels = (size_t)img.width * (size_t)img.height;
+        uint64_t acc = 0;
+        size_t count = 0;
+        for (size_t i = 0; i < pixels; i += 7) {
+            const uint8_t *p = px + i * 3;
+            acc += (uint32_t)p[0] * 299u + (uint32_t)p[1] * 587u + (uint32_t)p[2] * 114u;
+            count++;
+        }
+        luma = count ? (int)(acc / count / 1000u) : -1;
+        *mean_luma = luma;
     }
 
     /* ---- 2. 人脸检测 ---- */
@@ -154,8 +177,8 @@ extern "C" int bot_face_rec_run(const uint8_t *jpeg, size_t len, bot_face_t *out
 
     heap_caps_free(img.data);
 
-    ESP_LOGI(TAG, "人脸识别: 检测到 %d 张（%dx%d 解码+检测 %lld ms，特征 %lld ms，总 %lld ms）",
-             n, img.width, img.height, (long long)det_ms, (long long)feat_ms,
+    ESP_LOGI(TAG, "人脸识别: 检测到 %d 张（%dx%d 亮度=%d 解码+检测 %lld ms，特征 %lld ms，总 %lld ms）",
+             n, img.width, img.height, luma, (long long)det_ms, (long long)feat_ms,
              (long long)((esp_timer_get_time() - t0) / 1000));
     return n;
 }

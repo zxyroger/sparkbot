@@ -550,6 +550,13 @@ class Agent:
             return None, ""
 
         if not scan.faces:
+            if scan.too_dark:
+                # 别把"太黑"说成"没人"—— 前者要人去开灯/调角度，
+                # 后者是正常结果，混在一起用户会以为是识别坏了。
+                return scan, (
+                    f"摄像头画面很暗（平均亮度 {scan.mean_luma}/255），看不清前面有没有人。"
+                    "可以提醒对方把灯打开或让光线照到镜头这一侧。"
+                )
             return scan, "摄像头里没有检测到人脸。"
 
         try:
@@ -626,6 +633,8 @@ class Agent:
             "count": len(scan.faces),
             "width": scan.width,
             "height": scan.height,
+            "mean_luma": scan.mean_luma,
+            "too_dark": scan.too_dark,
             "faces": rows,
             "people": self.face_db.snapshot(),
         }
@@ -647,6 +656,11 @@ class Agent:
 
         scan = await robot.identify_faces()
         if not scan.faces:
+            if scan.too_dark:
+                raise SparkBotError(
+                    f"画面太暗（平均亮度 {scan.mean_luma}/255），看不清脸；"
+                    "请先把灯打开或让光线照到这一侧再试"
+                )
             raise SparkBotError("这一帧里没有检测到人脸，请让对象正对摄像头再试一次")
 
         face = max(

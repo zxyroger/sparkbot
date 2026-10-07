@@ -760,7 +760,8 @@ static cJSON *exec_action(const char *action, const cJSON *params,
         }
 
         static bot_face_t faces[BOT_FACE_MAX];
-        int n = bot_face_rec_run(jpeg, jlen, faces, BOT_FACE_MAX);
+        int mean_luma = -1;
+        int n = bot_face_rec_run(jpeg, jlen, faces, BOT_FACE_MAX, &mean_luma);
         bot_camera_frame_release();
 
         if (n < 0) {
@@ -774,6 +775,8 @@ static cJSON *exec_action(const char *action, const cJSON *params,
         cJSON_AddNumberToObject(d, "count", n);
         cJSON_AddNumberToObject(d, "width", fw);
         cJSON_AddNumberToObject(d, "height", fh);
+        /* 画面平均亮度 0~255：PC 侧用它区分「没人」和「太黑/镜头被挡」。 */
+        cJSON_AddNumberToObject(d, "mean_luma", mean_luma);
         /* 特征是 float32 且已 L2 归一化 —— PC 侧点积即为余弦相似度。 */
         cJSON_AddStringToObject(d, "feat_format", "float32");
         cJSON *arr = cJSON_CreateArray();

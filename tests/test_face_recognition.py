@@ -259,6 +259,37 @@ async def test_delete_and_privacy(served: ServedApp, rt: SparkBotRuntime) -> Non
 # --------------------------------------------------------------------------- #
 # 主流程
 # --------------------------------------------------------------------------- #
+async def test_too_dark(served: ServedApp, rt: SparkBotRuntime) -> None:
+    """阶段 6：「太黑」必须和「没人」区分开。
+
+    两者都表现为"检测到 0 张脸"，但一个是环境/硬件问题（要开灯），
+    一个是正常结果。混在一起用户会以为识别功能坏了 ——
+    固件因此回传画面平均亮度，PC 侧据此给出不同的提示。
+    """
+    logger.info("阶段 6 · 太暗与没人的区分")
+    import httpx
+
+    robot = rt.robots.get()
+    await robot.conn.command("config", {"face_people": [], "face_luma": 8})
+    async with httpx.AsyncClient(base_url=served.base_url, timeout=20.0) as client:
+        scan = (await client.post("/api/faces/scan", json={})).json()
+        check(scan.get("count") == 0, "暗环境下没有检出人脸")
+        check(scan.get("mean_luma") == 8, "设备回传的画面亮度被透出", str(scan.get("mean_luma")))
+        check(scan.get("too_dark") is True, "判定为「太暗」而不是「没人」")
+
+        # 工具层的说法也要跟着变：不能对用户说"没人"
+        tool = await rt.registry.execute("who_is_here", {})
+        summary = str((tool.data or {}).get("summary", ""))
+        check("太暗" in summary or "亮度" in summary,
+              "who_is_here 工具说的是「太暗」而不是「没人」", summary[:60])
+
+        # 注入到对话上下文的那句话也必须说明是暗，而不是"面前没人"
+        _, hint = await rt.agents.get()._look_at_faces()  # noqa: SLF001
+        check("暗" in hint or "亮度" in hint, "注入的提示词说明了画面太暗", hint[:60])
+
+    await robot.conn.command("config", {"face_people": ["张三"], "face_luma": 42})
+
+
 async def main() -> int:
     """启动真实服务 + 模拟设备，跑完全部阶段。"""
     with tempfile.TemporaryDirectory() as tmp:
@@ -289,6 +320,7 @@ async def main() -> int:
             await test_agent_uses_names(served, rt)
             await test_auto_bind_from_introduction(served, rt)
             await test_delete_and_privacy(served, rt)
+            await test_too_dark(served, rt)
         finally:
             await device.stop()
             with contextlib.suppress(asyncio.CancelledError, Exception):

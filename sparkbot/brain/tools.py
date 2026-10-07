@@ -219,9 +219,23 @@ def build_registry(ctx: ToolContext) -> ToolRegistry:
             return _failure(exc.message)
 
         if not scan.faces:
+            if scan.too_dark:
+                return {
+                    "ok": True,
+                    "count": 0,
+                    "too_dark": True,
+                    "mean_luma": scan.mean_luma,
+                    "summary": (
+                        f"画面太暗（平均亮度 {scan.mean_luma}/255），看不清有没有人。"
+                        "要提醒用户把灯打开或调整光线，别直接说「没人」。"
+                    ),
+                    "faces": [],
+                }
             return {
                 "ok": True,
                 "count": 0,
+                "too_dark": False,
+                "mean_luma": scan.mean_luma,
                 "summary": "画面里没有看到人脸。",
                 "faces": [],
             }
@@ -241,6 +255,7 @@ def build_registry(ctx: ToolContext) -> ToolRegistry:
         return {
             "ok": True,
             "count": len(scan.faces),
+            "mean_luma": scan.mean_luma,
             "summary": summary,
             "faces": [m.to_dict() for m in matches],
             "known_names": [m.name for m in known],
@@ -273,6 +288,11 @@ def build_registry(ctx: ToolContext) -> ToolRegistry:
             return _failure(exc.message)
 
         if not scan.faces:
+            if scan.too_dark:
+                return _failure(
+                    f"画面太暗（平均亮度 {scan.mean_luma}/255），看不清脸；"
+                    "请先开灯或让光线照到镜头这一侧再试。"
+                )
             return _failure("这一帧里没有检测到人脸，请让对方面向摄像头再试。")
 
         face = max(

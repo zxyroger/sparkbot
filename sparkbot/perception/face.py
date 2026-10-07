@@ -128,6 +128,19 @@ class FaceScan:
     faces: list[FaceObservation] = field(default_factory=list)
     width: int = 0
     height: int = 0
+    #: 设备侧算出的画面平均亮度 0~255（设备不回就是 -1）。
+    #: 用来区分「镜头前没人」和「画面太黑 / 镜头被挡」——
+    #: 两者都会表现为"检测到 0 张脸"，但处理方式完全不同。
+    mean_luma: int = -1
+
+    #: 低于这个亮度就算"太暗"：人脸检测在这种画面上基本不可靠。
+    #: 依据是实测数据 —— 近全黑的画面约 8，正常室内 30~50。
+    DARK_LUMA_THRESHOLD = 20
+
+    @property
+    def too_dark(self) -> bool:
+        """画面是否暗到没法做人脸识别。"""
+        return 0 <= self.mean_luma < self.DARK_LUMA_THRESHOLD
 
     def __len__(self) -> int:
         return len(self.faces)
@@ -138,6 +151,8 @@ class FaceScan:
             "count": len(self.faces),
             "width": self.width,
             "height": self.height,
+            "mean_luma": self.mean_luma,
+            "too_dark": self.too_dark,
             "faces": [f.to_dict() for f in self.faces],
         }
 

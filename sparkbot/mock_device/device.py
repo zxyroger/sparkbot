@@ -104,6 +104,9 @@ class MockDeviceConfig:
     face_noise: float = 0.03
     """人脸特征的抖动量，模拟同一个人不同帧之间的差异。"""
 
+    face_luma: int = 42
+    """人脸识别时回报的画面平均亮度（0~255）。设成 <20 可模拟"太暗"。"""
+
     stuck_after_s: float = 0.0
     """大于 0 时模拟设备在该秒数后失联（用于测试掉线处理）。"""
 
@@ -497,6 +500,7 @@ class MockDevice:
             "count": len(faces),
             "width": self.config.frame_width,
             "height": self.config.frame_height,
+            "mean_luma": int(self.config.face_luma),
             "feat_format": "float32",
             "faces": faces,
         }
@@ -707,6 +711,10 @@ class MockDevice:
                 raw = [raw]
             self.config.face_people = [str(item) for item in raw]
             logger.info("🙂 模拟场景里的人换成：%s", self.config.face_people or "—")
+        # face_luma：模拟"把灯关了"，用来验证「太暗」这条分支。
+        if "face_luma" in params:
+            self.config.face_luma = int(params["face_luma"])
+            logger.info("💡 模拟画面亮度 = %d", self.config.face_luma)
         return {"applied": {k: v for k, v in params.items()}}
 
     async def _do_reboot(self, params: dict[str, Any]) -> dict[str, Any]:

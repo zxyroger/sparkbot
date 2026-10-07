@@ -60,11 +60,18 @@ bool bot_face_rec_ready(void);
  *   jpeg/len: JPEG 字节（就是摄像头抓的那一帧，不用转格式）。
  *   out:      输出数组，至少能放 max_faces 个 bot_face_t。
  *   max_faces: 最多返回几张脸（<= BOT_FACE_MAX）。
+ *   mean_luma: 输出解码画面的**平均亮度** 0~255；可为 NULL。
+ *
+ *             为什么要回这个数：光看"检测到 0 张"分不清是「镜头前没人」
+ *             还是「画面太黑 / 镜头被挡」—— 后者是硬件问题，让人去调灯、
+ *             调角度即可；前者才是正常结果。实测近全黑的画面平均亮度只有
+ *             8 左右，正常室内是 30~50。
  *
  * Returns:
  *   识别到的人脸数（>=0）；<0 表示失败（解码失败/模型未就绪）。
  */
-int bot_face_rec_run(const uint8_t *jpeg, size_t len, bot_face_t *out, int max_faces);
+int bot_face_rec_run(const uint8_t *jpeg, size_t len, bot_face_t *out, int max_faces,
+                     int *mean_luma);
 
 #ifdef __cplusplus
 }

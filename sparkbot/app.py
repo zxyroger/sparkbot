@@ -1687,10 +1687,21 @@ async function faceScan() {
       headers: {"Content-Type": "application/json"}, body: "{}"});
     const data = await res.json();
     if (!res.ok) { box.textContent = "失败：" + (data.detail || res.status); return; }
-    if (!data.count) { box.textContent = "没有检测到人脸。"; faceRenderPeople(data.people); return; }
-    box.textContent = data.faces.map(f =>
+    const luma = (data.mean_luma === undefined || data.mean_luma === null)
+      ? "" : `  画面亮度 ${data.mean_luma}/255`;
+    if (!data.count) {
+      // 「太黑」和「没人」要分开说：前者是硬件/环境问题，后者是正常结果。
+      box.textContent = (data.too_dark
+        ? "画面太暗，看不清有没有人 —— 先把灯打开或让光线照到镜头这一侧。" + luma
+        : "没有检测到人脸。" + luma);
+      faceRenderPeople(data.people);
+      return;
+    }
+    let text = data.faces.map(f =>
       `${f.known ? "✅ " + f.name : "❓ 未登记"}  相似度 ${Number(f.similarity).toFixed(3)}` +
       `  检测分 ${Number(f.score).toFixed(2)}  框 ${f.box.join(",")}`).join("\\n");
+    if (luma) text += "\\n" + luma;
+    box.textContent = text;
     faceRenderPeople(data.people);
   } catch (err) { box.textContent = "出错：" + err; }
 }
