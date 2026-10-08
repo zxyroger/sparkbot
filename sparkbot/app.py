@@ -1728,6 +1728,9 @@ async function faceEnroll() {
 }
 
 async function faceDelete(name) {
+  // 必须确认：人脸绑定点一下就没，误触代价很高（重新绑要人站到镜头前）。
+  // 控制台里人头是按钮形式，之前一点就删 —— 实测被误删过一次。
+  if (!confirm("删掉「" + name + "」的人脸绑定？以后就认不出他了。")) return;
   await fetch("api/faces/" + encodeURIComponent(name), {method: "DELETE"});
   faceRefresh();
 }

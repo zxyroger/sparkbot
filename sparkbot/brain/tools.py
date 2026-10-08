@@ -268,10 +268,13 @@ def build_registry(ctx: ToolContext) -> ToolRegistry:
 
     @registry.register(requires={CAP_CAMERA}, dangerous=False)
     async def bind_face(name: str, device_id: str = "") -> dict[str, Any]:
-        """把眼前这个人的脸和名字绑定，以后就能认出他。
+        """把眼前这张脸和身份绑起来，以后就能认出他（姓名，或「小明的爸爸」这类称呼都行）。
 
         什么时候该用：用户自我介绍之后（「我叫张伟」「我是李工」），
         或用户明确要求「记住我的脸」「把这张脸绑到 XX 上」。
+
+        注意工具描述只取本 docstring 的**第一段**，所以"关系称呼也算身份"
+        这点必须写在第一段里（不然模型看不到，只会绑姓名）。
 
         ``name`` 不一定是姓名，**关系称呼同样有效**，而且往往更自然：
         「小明的爸爸」「王阿姨」「我的同事小李」。机器人需要的只是一个
