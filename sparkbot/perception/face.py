@@ -259,6 +259,7 @@ class FaceDB:
                     "created_at": float(entry.get("created_at") or time.time()),
                     "updated_at": float(entry.get("updated_at") or time.time()),
                     "hits": int(entry.get("hits") or 0),
+                    "source": str(entry.get("source") or ""),
                 }
             logger.info("人脸库已加载: %d 人 / %d 条特征（%s）",
                         len(self._people), self.sample_count(), self.path)
@@ -282,6 +283,9 @@ class FaceDB:
                         "created_at": entry["created_at"],
                         "updated_at": entry["updated_at"],
                         "hits": entry["hits"],
+                        # source 也要落盘：重载后还能看出这条是谁写进来的
+                        # （auto=聊天里自动绑的 / tool=模型调的 / user=接口调的）。
+                        "source": entry.get("source", ""),
                     }
                     for name, entry in self._people.items()
                 },

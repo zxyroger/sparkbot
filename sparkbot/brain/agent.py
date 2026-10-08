@@ -68,41 +68,130 @@ def face_db_path(settings: Settings) -> Path:
     return vendor_dir().parent / raw
 
 
-def extract_self_name(text: str) -> str | None:
-    """从用户话语里抽出他**自报的姓名**，抽不到返回 ``None``。
+@dataclass(slots=True)
+class IdentityHint:
+    """从一句话里抽出的**身份信息**（用来绑人脸 + 写长期记忆）。
 
-    只认"我叫…""我是…""叫我…""我的名字是…"这几种明确的自我介绍句式。
-    为什么不复用 ``_MEMORY_PATTERNS`` 里的身份规则：那条规则会把
-    "我是学生""我是工程师"里的**职业**也当成名字记下来 —— 用于写一条
-    长期记忆无伤大雅，但拿去绑人脸就会把张三的脸挂到"学生"这个名字上。
-    所以这里额外加了一道"像不像名字"的过滤。
+    ``label`` 是绑到人脸上、以后用来称呼对方的标签。它**可以是姓名，
+    也可以是一个关系称呼**（「小明的爸爸」）—— 机器人并不需要知道
+    户口本上的名字，只要每次都能对上同一个称呼，就能稳定地认出"这是谁"、
+    并把之前聊过的内容算到他头上。
     """
-    haystack = (text or "").strip()
+
+    label: str
+    """标签，如「王可旭」「小明的爸爸」。"""
+
+    fact: str
+    """写进长期记忆的完整事实句（自包含，脱离上下文也读得懂）。"""
+
+    kind: str
+    """``name``（自报姓名）/ ``relation``（关系）。"""
+
+    def __str__(self) -> str:  # 方便日志里直接插值
+        return self.label
+
+
+def extract_identity(text: str) -> IdentityHint | None:
+    """从用户话语里抽出**身份信息**：姓名，或关系（「小明的爸爸」）。
+
+    支持的句式（**顺序即优先级**）：
+
+    * 关系型：``我是小明的爸爸`` / ``我叫小明的妈妈`` / ``我是爸爸``
+    * 整句就是一个身份短语（在回答"你是谁"）：``小明的爸爸``
+    * 姓名型：``我叫王可旭`` / ``我是李白`` / ``我的名字是…`` / ``叫我小明``
+
+    为什么关系型必须排在最前面：``我是小明的爸爸`` 若先走姓名规则，
+    会被正则截出「小明的爸」当成名字 —— 这不是推测，是实测遇到的。
+
+    为什么"关系"也算身份：机器人不需要知道对方户口本上的名字，
+    只要每次都对得上同一个称呼（"小明的爸爸"）就够了。反过来，
+    **纯职业不算**（"我是老师""我是工程师"）—— 把一张脸绑到"老师"上，
+    下一个老师进来就会被认成同一个人，所以职业只有在**挂在某个名字下面**
+    时才算身份（"我是小明的老师"可以，"我是老师"不行）。
+
+    抽不到、或看起来不像"人"时返回 ``None``。
+    """
+    haystack = " ".join((text or "").split())
     if not haystack or len(haystack) > 60:
         return None
-    for pattern in _SELF_NAME_PATTERNS:
+
+    for pattern, kind in _IDENTITY_PATTERNS:
         m = pattern.search(haystack)
         if not m:
             continue
-        name = m.group(1).strip(" 　.·、,，")
-        # 中文姓名 2~4 字；英文名允许带空格与点（"Li Ming"、"J. Smith"）。
+        groups = m.groupdict()
+
+        if kind == "relation":
+            owner = (groups.get("owner") or "").strip(" 　.·、,，")
+            relation = groups.get("relation") or ""
+            # 名字里不会出现「的」，也不会以人称代词开头。
+            # 出现这两种情况说明是切错了（例如把「我是王」当成名字，
+            # 拼出「我是王的爸爸」这种荒唐标签）。宁可不绑，也不要绑错。
+            if "的" in owner or owner.startswith(("我", "你", "他", "她")):
+                continue
+            if owner in _NOT_A_NAME:
+                continue
+            label = f"{owner}的{relation}" if owner else relation
+            return IdentityHint(label=label, fact=f"用户是{label}", kind="relation")
+
+        name = (groups.get("name") or "").strip(" 　.·、,，")
         if not name:
+            continue
+        if "的" in name:
+            # 「我是小明的爸爸」这类句子没被上面的关系规则吃掉时，
+            # 姓名规则会截出「小明的爸」—— 带「的」的一律不算名字。
             continue
         if name in _NOT_A_NAME:
             logger.debug("「%s」看着不像名字，跳过人脸绑定", name)
             continue
-        return name
+        return IdentityHint(label=name, fact=f"用户叫{name}", kind="name")
     return None
 
 
-#: 自我介绍句式 → 姓名（按"明确程度"排序，先匹配到的算数）。
-_SELF_NAME_PATTERNS = [
-    re.compile(r"我(?:的名字)?(?:叫|是)\s*([\u4e00-\u9fff]{2,4})"),
-    re.compile(r"(?:我的)?名字(?:是|叫)\s*([\u4e00-\u9fff]{2,4})"),
-    re.compile(r"叫我\s*([\u4e00-\u9fff]{2,4})"),
-    re.compile(r"我(?:的名字)?(?:叫|是)\s*([A-Za-z][A-Za-z .'\-]{0,20})"),
-    re.compile(r"(?:我的)?名字(?:是|叫)\s*([A-Za-z][A-Za-z .'\-]{0,20})"),
-    re.compile(r"叫我\s*([A-Za-z][A-Za-z .'\-]{0,20})"),
+def extract_self_name(text: str) -> str | None:
+    """只取**姓名**（兼容旧调用）；关系型身份返回 ``None``。"""
+    hint = extract_identity(text)
+    return hint.label if hint and hint.kind == "name" else None
+
+
+#: 一个"名字"：中文 2~4 字，或英文（可带空格、点、连字符）。
+_NAME_RE = r"(?:[\u4e00-\u9fff]{2,4}|[A-Za-z][A-Za-z .'\-]{0,20})"
+
+#: **亲属称谓**：这类词本身就能构成身份（"我是爸爸"），可以单独绑脸。
+_KINSHIP = (
+    "爸爸", "妈妈", "父亲", "母亲", "老爸", "老妈", "爹", "娘",
+    "儿子", "女儿", "老公", "老婆", "丈夫", "妻子", "爱人",
+    "哥哥", "姐姐", "弟弟", "妹妹",
+    "爷爷", "奶奶", "外公", "外婆", "姥姥", "姥爷",
+)
+
+#: **其他关系/职业**：必须挂在名字下面才算身份（"小明的老师"），
+#: 单独出现（"我是老师"）不绑 —— 否则下一个老师会被认成同一个人。
+_ROLE = (
+    "老师", "同学", "同事", "朋友", "老板", "教练", "师傅", "房东",
+    "叔叔", "阿姨", "舅舅", "姑姑", "伯伯", "婶婶",
+)
+
+_KINSHIP_ALT = "|".join(_KINSHIP)
+_ROLE_ALT = "|".join(_ROLE)
+_ANY_RELATION_ALT = f"{_KINSHIP_ALT}|{_ROLE_ALT}"
+
+#: 身份句式表：``(正则, kind)``。**顺序即优先级**，关系型必须在姓名型之前。
+_IDENTITY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # 关系型（带名字）：我是小明的爸爸 / 我叫小明的老师
+    (re.compile(rf"我(?:是|叫)\s*(?P<owner>{_NAME_RE})的(?P<relation>{_ANY_RELATION_ALT})"),
+     "relation"),
+    # 关系型（不带名字，仅限亲属）：我是爸爸 / 我是妈妈
+    (re.compile(rf"我(?:是|叫)\s*(?P<relation>{_KINSHIP_ALT})"), "relation"),
+    # 整句就是一个身份短语（在回答"你是谁"）：小明的爸爸
+    # 整句身份短语：必须以**非人称代词**开头，否则「我是王的爸爸」会被
+    # 当成 owner="我是王" 而拼出一个荒唐的标签（踩过）。
+    (re.compile(rf"^(?!我|你|他|她)(?P<owner>{_NAME_RE})的(?P<relation>{_ANY_RELATION_ALT})$"),
+     "relation"),
+    # 姓名型
+    (re.compile(rf"我(?:的名字)?(?:叫|是)\s*(?P<name>{_NAME_RE})"), "name"),
+    (re.compile(rf"(?:我的)?名字(?:是|叫)\s*(?P<name>{_NAME_RE})"), "name"),
+    (re.compile(rf"叫我\s*(?P<name>{_NAME_RE})"), "name"),
 ]
 
 #: 自我介绍句式里常见、但**不是名字**的词。
@@ -385,6 +474,9 @@ class Agent:
             "4. 用户表达情绪或对话气氛变化时，主动调用 show_emotion 换表情。\n"
             "5. 回复要短，两三句话说完，因为是要被语音播报出来的。\n"
             "6. 工具返回失败时，用自然语言说明做不到，不要假装成功。\n"
+            "7. 一旦知道面前的人是谁 —— 姓名，或者「小明的爸爸」「我是妈妈」"
+            "这类称呼 —— 就调用 bind_face 把眼前这张脸和这个称呼绑起来，"
+            "以后才认得出他。称呼用用户自己说的说法，不要改写成别的词。\n"
         )
 
     def _device_context(self) -> str:
@@ -704,19 +796,32 @@ class Agent:
         return {"ok": True, **entry}
 
     def _auto_bind_face(self, user_text: str, scan: FaceScan | None) -> None:
-        """用户自报姓名时，自动把眼前这张脸绑上 —— 「自动关联名字」的核心。
+        """从这句话里认出身份时，自动绑脸 + 写长期记忆 —— 「自动关联名字」的核心。
 
-        只在**同一轮里既有人说名字、又刚好扫到脸**时才绑，避免：
-        * 有人报名字但画面里没脸（对着摄像头外说话）→ 绑不上去；
-        * 画面里有一堆脸而没报名字 → 不知道绑谁。
+        身份**不限于姓名**：``我叫王可旭``、``我是小明的爸爸``、``我是妈妈``、
+        以及把整个句子当回答用的 ``小明的爸爸`` 都算（见 :func:`extract_identity`）。
+        关系型身份和姓名同等对待 —— 机器人不需要知道户口本上的名字，
+        只要每次都对得上同一个称呼就够了。
+
+        绑脸要求**同一轮里既说了身份、又刚好扫到脸**：
+        * 报了身份但画面里没脸（人在镜头外）→ 只记事实，不绑；
+        * 画面里有一堆脸而没报身份 → 不知道绑谁，不绑。
+        之所以取"最大的那张脸"：离摄像头最近的人通常就是正在说话的人。
         """
-        if self.face_db is None or scan is None or not scan.faces:
-            return
-        if not self.settings.face.enabled or not self.settings.face.auto_enroll:
+        hint = extract_identity(user_text)
+        if hint is None:
             return
 
-        name = extract_self_name(user_text)
-        if not name:
+        can_bind = (
+            self.face_db is not None
+            and self.settings.face.enabled
+            and self.settings.face.auto_enroll
+            and scan is not None
+            and bool(scan.faces)
+        )
+        if not can_bind:
+            # 没拍到脸也要把身份记下来：下次认不出来时还能靠称呼对上人。
+            self._remember_identity(hint, bound=False)
             return
 
         face = max(
@@ -724,20 +829,39 @@ class Agent:
             key=lambda f: max(0, f.box[2] - f.box[0]) * max(0, f.box[3] - f.box[1]),
         )
         try:
-            entry = self.face_db.enroll(name, face.feat, source="auto")
+            entry = self.face_db.enroll(hint.label, face.feat, source="auto")
         except Exception as exc:  # noqa: BLE001 - 绑不上不该影响对话
             logger.debug("自动人脸绑定失败: %s", exc, exc_info=True)
             return
         if entry is None:
             return
-        logger.info("自动人脸绑定: %s（累计 %d 条特征）", entry["name"], entry["samples"])
+
+        logger.info(
+            "自动人脸绑定: %s（%s，累计 %d 条特征）",
+            entry["name"], hint.kind, entry["samples"],
+        )
         self.bus.publish(
             "face.bound",
             device_id=self.device_id,
             name=entry["name"],
             samples=entry["samples"],
+            kind=hint.kind,
             reason="auto",
         )
+        self._remember_identity(hint, bound=True)
+
+    def _remember_identity(self, hint: IdentityHint, *, bound: bool) -> None:
+        """把身份写进长期记忆；``bound`` 表示这次是否真的绑上了脸。
+
+        只有真绑上了才写「（已绑定人脸）」—— 没拍到脸时说这句就是假的。
+        """
+        if self.long_term is None:
+            return
+        fact = f"{hint.fact}（已绑定人脸）" if bound else hint.fact
+        try:
+            self.long_term.remember(fact, importance=5, source="face")
+        except Exception:  # noqa: BLE001 - 记忆写失败不该影响对话
+            logger.debug("身份写长期记忆失败: %s", fact, exc_info=True)
 
     # ------------------------------------------------------------------ #
     # 主循环

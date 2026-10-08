@@ -227,6 +227,44 @@ async def test_auto_bind_from_introduction(served: ServedApp, rt: SparkBotRuntim
               "新一轮对话里认出了王五", str(chat.get("faces")))
 
 
+async def test_relation_identity(served: ServedApp, rt: SparkBotRuntime) -> None:
+    """阶段 4b：关系型身份（"我是小明的爸爸"）也要绑脸 + 进长期记忆。
+
+    机器人不需要知道对方户口本上的名字 —— 只要能对上一个稳定的称呼，
+    就能一直认出这个人，并把之前聊过的内容算到他头上。
+
+    同时守住反向边界：**纯职业不绑**（"我是老师"）。
+    否则一张脸被绑成"老师"，下一个老师进来就会被认成同一个人。
+    """
+    logger.info("阶段 4b · 关系型身份")
+    import httpx
+
+    await rt.robots.get().conn.command("config", {"face_people": ["小明爸爸"]})
+    async with httpx.AsyncClient(base_url=served.base_url, timeout=30.0) as client:
+        await client.post("/api/chat", json={"text": "你好，我是小明的爸爸"})
+        listed = (await client.get("/api/faces")).json()
+        names = [p["name"] for p in listed["people"]]
+        check("小明的爸爸" in names, "关系型身份也绑上了脸", str(names))
+
+        mem = (await client.get("/api/memory")).json()
+        facts = [f["content"] for f in mem.get("facts", [])]
+        check(any("小明的爸爸" in c for c in facts), "关系写进了长期记忆", str(facts)[:90])
+
+        # 认出来之后，下一轮上下文里应当带上这个称呼
+        chat = (await client.post("/api/chat", json={"text": "你还记得我是谁吗"})).json()
+        check(any(f.get("name") == "小明的爸爸" for f in (chat.get("faces") or [])),
+              "下一轮就认出了「小明的爸爸」", str(chat.get("faces")))
+
+        # 反向边界：职业不能单独当身份
+        await client.post("/api/chat", json={"text": "其实我是老师"})
+        after = (await client.get("/api/faces")).json()
+        check(all(p["name"] != "老师" for p in after["people"]),
+              "纯职业不会被绑成身份（不然所有老师都会被认成同一个人）",
+              str([p["name"] for p in after["people"]]))
+
+    await rt.robots.get().conn.command("config", {"face_people": ["张三"]})
+
+
 async def test_delete_and_privacy(served: ServedApp, rt: SparkBotRuntime) -> None:
     """阶段 5：删除（用户的生物特征控制权）+ 关掉开关时的降级。"""
     logger.info("阶段 5 · 删除与降级")
@@ -354,6 +392,7 @@ async def main() -> int:
             await test_enroll_and_recognize(served, rt)
             await test_agent_uses_names(served, rt)
             await test_auto_bind_from_introduction(served, rt)
+            await test_relation_identity(served, rt)
             await test_delete_and_privacy(served, rt)
             await test_too_dark(served, rt)
             await test_partial_feature(served, rt)
