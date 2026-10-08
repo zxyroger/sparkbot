@@ -557,6 +557,18 @@ class Agent:
                     f"摄像头画面很暗（平均亮度 {scan.mean_luma}/255），看不清前面有没有人。"
                     "可以提醒对方把灯打开或让光线照到镜头这一侧。"
                 )
+            if scan.dropped:
+                # 设备说检到了脸、特征却用不了（字段缺失/解不开）。
+                # 这不是"没人"，而是链路坏了，必须说出来而不是显示成 0。
+                logger.warning(
+                    "设备报告 %d 张脸，但特征不可用的有 %d 张（疑似固件与 PC 侧版本不匹配）",
+                    scan.reported_count,
+                    scan.dropped,
+                )
+                return scan, (
+                    f"设备其实检测到 {scan.reported_count} 张脸，但人脸特征数据不完整，"
+                    "没法认人。这通常是固件与 PC 端版本不匹配，需要更新固件。"
+                )
             return scan, "摄像头里没有检测到人脸。"
 
         try:
@@ -631,6 +643,8 @@ class Agent:
             "ok": True,
             "device_id": robot.device_id,
             "count": len(scan.faces),
+            "reported_count": scan.reported_count,
+            "dropped": scan.dropped,
             "width": scan.width,
             "height": scan.height,
             "mean_luma": scan.mean_luma,
@@ -660,6 +674,11 @@ class Agent:
                 raise SparkBotError(
                     f"画面太暗（平均亮度 {scan.mean_luma}/255），看不清脸；"
                     "请先把灯打开或让光线照到这一侧再试"
+                )
+            if scan.dropped:
+                raise SparkBotError(
+                    f"设备检测到 {scan.reported_count} 张脸，但人脸特征数据不完整，绑不了"
+                    "（通常是固件与 PC 端版本不匹配，需要更新固件）"
                 )
             raise SparkBotError("这一帧里没有检测到人脸，请让对象正对摄像头再试一次")
 

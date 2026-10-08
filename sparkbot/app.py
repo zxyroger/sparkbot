@@ -1690,6 +1690,13 @@ async function faceScan() {
     const luma = (data.mean_luma === undefined || data.mean_luma === null)
       ? "" : `  画面亮度 ${data.mean_luma}/255`;
     if (!data.count) {
+      // 设备说检到了脸、特征却用不了 —— 这是链路坏了，不能显示成"没人"。
+      if (data.dropped) {
+        box.textContent = `设备检测到 ${data.reported_count} 张脸，但人脸特征数据不完整，认不出是谁；`
+          + "通常是固件与 PC 端版本不匹配，请更新固件。" + luma;
+        faceRenderPeople(data.people);
+        return;
+      }
       // 「太黑」和「没人」要分开说：前者是硬件/环境问题，后者是正常结果。
       box.textContent = (data.too_dark
         ? "画面太暗，看不清有没有人 —— 先把灯打开或让光线照到镜头这一侧。" + luma

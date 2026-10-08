@@ -231,6 +231,11 @@ def build_registry(ctx: ToolContext) -> ToolRegistry:
                     ),
                     "faces": [],
                 }
+            if scan.dropped:
+                return _failure(
+                    f"设备检测到 {scan.reported_count} 张脸，但人脸特征数据不完整，认不出是谁"
+                    "（通常是固件与 PC 端版本不匹配）"
+                )
             return {
                 "ok": True,
                 "count": 0,

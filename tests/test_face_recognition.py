@@ -290,6 +290,41 @@ async def test_too_dark(served: ServedApp, rt: SparkBotRuntime) -> None:
     await robot.conn.command("config", {"face_people": ["张三"], "face_luma": 42})
 
 
+async def test_partial_feature(served: ServedApp, rt: SparkBotRuntime) -> None:
+    """阶段 7：设备报"检测到 N 张"但特征回传不完整时，必须显式报出来。
+
+    这是真实踩过的坑（固件用 `mbedtls_base64_encode(NULL, 0, &need, ...)`
+    查长度，拿到的是错误码而不是 0，于是特征串压根没写进 JSON）。
+    当时的表现是：设备日志明明写着"检测到 1 张、特征提取成功"，
+    接口却返回 `count: 0`，看上去就像"镜头前没人" —— 把固件 bug 硬生生藏了几天。
+    所以现在两边都要能分辨"没人"和"数据坏了"。
+    """
+    logger.info("阶段 7 · 特征回传不完整")
+    import httpx
+
+    robot = rt.robots.get()
+    await robot.conn.command("config", {"face_people": ["张三"], "face_strip_feat": True})
+    try:
+        async with httpx.AsyncClient(base_url=served.base_url, timeout=20.0) as client:
+            scan = (await client.post("/api/faces/scan", json={})).json()
+            check(scan.get("count") == 0, "拿不到特征时不能假装认出来了")
+            check(scan.get("reported_count") == 1, "仍然如实转达设备自报的脸数",
+                  str(scan.get("reported_count")))
+            check(scan.get("dropped") == 1, "并明确指出有几张脸被丢掉了",
+                  str(scan.get("dropped")))
+
+        tool = await rt.registry.execute("who_is_here", {})
+        # 工具内部把失败写进返回体的 ok/error（注册表层面仍是"执行成功"），
+        # 所以这里看的是 data，而不是 ToolResult.ok。
+        payload = tool.data or {}
+        detail = str(payload.get("error") or payload.get("summary") or "")
+        check(payload.get("ok") is False and ("不完整" in detail or "特征" in detail),
+              "工具如实报告特征数据有问题，而不是说「没人」", detail[:60])
+    finally:
+        # 无论断言如何，都要把模拟状态恢复，别污染后面的用例。
+        await robot.conn.command("config", {"face_strip_feat": False, "face_people": []})
+
+
 async def main() -> int:
     """启动真实服务 + 模拟设备，跑完全部阶段。"""
     with tempfile.TemporaryDirectory() as tmp:
@@ -321,6 +356,7 @@ async def main() -> int:
             await test_auto_bind_from_introduction(served, rt)
             await test_delete_and_privacy(served, rt)
             await test_too_dark(served, rt)
+            await test_partial_feature(served, rt)
         finally:
             await device.stop()
             with contextlib.suppress(asyncio.CancelledError, Exception):

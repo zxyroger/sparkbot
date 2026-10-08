@@ -128,6 +128,11 @@ class FaceScan:
     faces: list[FaceObservation] = field(default_factory=list)
     width: int = 0
     height: int = 0
+    #: 设备**自报**检出的脸数。正常等于 ``len(faces)``；比它大说明有脸被丢掉了
+    #: （特征字段缺失 / base64 解不开），属于真问题 —— 必须显式暴露，
+    #: 否则接口只会显示"0 张"，看上去像"镜头前没人"，把固件 bug 藏起来。
+    reported_count: int = 0
+
     #: 设备侧算出的画面平均亮度 0~255（设备不回就是 -1）。
     #: 用来区分「镜头前没人」和「画面太黑 / 镜头被挡」——
     #: 两者都会表现为"检测到 0 张脸"，但处理方式完全不同。
@@ -142,6 +147,11 @@ class FaceScan:
         """画面是否暗到没法做人脸识别。"""
         return 0 <= self.mean_luma < self.DARK_LUMA_THRESHOLD
 
+    @property
+    def dropped(self) -> int:
+        """设备检出了、但特征不可用而被丢掉的脸数。"""
+        return max(0, self.reported_count - len(self.faces))
+
     def __len__(self) -> int:
         return len(self.faces)
 
@@ -149,6 +159,8 @@ class FaceScan:
         """转成控制台/工具可用的字典。"""
         return {
             "count": len(self.faces),
+            "reported_count": self.reported_count,
+            "dropped": self.dropped,
             "width": self.width,
             "height": self.height,
             "mean_luma": self.mean_luma,

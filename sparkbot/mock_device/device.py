@@ -107,6 +107,14 @@ class MockDeviceConfig:
     face_luma: int = 42
     """人脸识别时回报的画面平均亮度（0~255）。设成 <20 可模拟"太暗"。"""
 
+    face_strip_feat: bool = False
+    """置 true 时故意**不回** feat_b64（只回框和分数）。
+
+    这是照着真实固件踩过的坑做的回归开关：`mbedtls_base64_encode(NULL, 0, ...)`
+    查长度会返回错误码而不是 0，于是特征串根本没写进 JSON，设备报"检测到 1 张"
+    而 PC 侧只能认成"0 张"。用它守住"这种半截数据必须显式报出来"的行为。
+    """
+
     stuck_after_s: float = 0.0
     """大于 0 时模拟设备在该秒数后失联（用于测试掉线处理）。"""
 
@@ -483,17 +491,17 @@ class MockDevice:
         for index, name in enumerate(people[:4]):   # 与固件一样最多 4 张
             feat = mock_face_feature(name, noise=max(0.0, float(self.config.face_noise)))
             x1 = 40 + index * 150
-            faces.append(
-                {
-                    "x1": x1,
-                    "y1": 80,
-                    "x2": x1 + 130,
-                    "y2": 260,
-                    "score": 0.93,
-                    "feat_len": len(feat),
-                    "feat_b64": encode_face_feat(feat),
-                }
-            )
+            entry: dict[str, Any] = {
+                "x1": x1,
+                "y1": 80,
+                "x2": x1 + 130,
+                "y2": 260,
+                "score": 0.93,
+                "feat_len": len(feat),
+            }
+            if not self.config.face_strip_feat:
+                entry["feat_b64"] = encode_face_feat(feat)
+            faces.append(entry)
 
         logger.info("🙂 人脸识别（模拟）：%d 张 %s", len(faces), people[:4] or "—")
         return {
@@ -715,6 +723,10 @@ class MockDevice:
         if "face_luma" in params:
             self.config.face_luma = int(params["face_luma"])
             logger.info("💡 模拟画面亮度 = %d", self.config.face_luma)
+        # face_strip_feat：模拟"设备回包缺 feat_b64"这种半截数据。
+        if "face_strip_feat" in params:
+            self.config.face_strip_feat = bool(params["face_strip_feat"])
+            logger.info("🧪 模拟特征缺失 = %s", self.config.face_strip_feat)
         return {"applied": {k: v for k, v in params.items()}}
 
     async def _do_reboot(self, params: dict[str, Any]) -> dict[str, Any]:

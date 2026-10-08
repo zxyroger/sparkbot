@@ -791,22 +791,35 @@ static cJSON *exec_action(const char *action, const cJSON *params,
 
             /* 512 维 float32 = 2048 字节 → base64 后 2731 字符，
              * 4 张脸约 11KB，远小于单条 WebSocket 消息上限（512KB）。
-             * 不做压缩：特征本来就是模型输出的原值，PC 侧零解码成本。 */
-            size_t need = 0;
-            if (mbedtls_base64_encode(NULL, 0, &need,
-                                      (const unsigned char *)faces[i].feat,
-                                      (size_t)faces[i].feat_len * sizeof(float)) == 0) {
-                char *b64 = malloc(need + 1);
-                if (b64 != NULL) {
-                    size_t out_len = 0;
-                    if (mbedtls_base64_encode((unsigned char *)b64, need + 1, &out_len,
-                                              (const unsigned char *)faces[i].feat,
-                                              (size_t)faces[i].feat_len * sizeof(float)) == 0) {
-                        b64[out_len] = '\0';
-                        cJSON_AddStringToObject(o, "feat_b64", b64);
-                    }
-                    free(b64);
+             * 不做压缩：特征本来就是模型输出的原值，PC 侧零解码成本。
+             *
+             * ⚠️ base64 缓冲长度**自己算**，不要用
+             * ``mbedtls_base64_encode(NULL, 0, &need, ...)`` 去"查长度"：
+             * 目标缓冲为 NULL 时它返回的是 MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL
+             * （虽然会把所需长度写进 need），**不是 0**。于是
+             * "结果 == 0 才算成功" 的判断永远不成立，字符串根本不会被写进去，
+             * 而且**一行日志都没有**。
+             *
+             * 症状极难定位：设备侧明明检测到了脸、也提取了特征，
+             * 回包里却只有 count/box/score 而**没有 feat_b64**；
+             * PC 侧只看到"特征字段缺失"，最终报成「检测不到人脸」。
+             * 这个坑只能靠对比两端的字段发现（踩过）。 */
+            const size_t feat_bytes = (size_t)faces[i].feat_len * sizeof(float);
+            const size_t b64_cap = ((feat_bytes + 2) / 3) * 4 + 1;
+            char *b64 = malloc(b64_cap);
+            if (b64 != NULL) {
+                size_t out_len = 0;
+                if (mbedtls_base64_encode((unsigned char *)b64, b64_cap, &out_len,
+                                          (const unsigned char *)faces[i].feat,
+                                          feat_bytes) == 0) {
+                    b64[out_len] = '\0';
+                    cJSON_AddStringToObject(o, "feat_b64", b64);
+                } else {
+                    ESP_LOGW(TAG, "人脸特征 base64 编码失败（第 %d 张）", i);
                 }
+                free(b64);
+            } else {
+                ESP_LOGW(TAG, "人脸特征编码缓冲分配失败（%u 字节）", (unsigned)b64_cap);
             }
             cJSON_AddItemToArray(arr, o);
         }

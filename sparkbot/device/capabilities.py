@@ -466,15 +466,22 @@ class Robot:
             width=int(data.get("width") or 0),
             height=int(data.get("height") or 0),
             mean_luma=int(data.get("mean_luma", -1)),
+            reported_count=int(data.get("count") or 0),
         )
         for raw in data.get("faces") or []:
             if not isinstance(raw, dict):
                 continue
-            feature = decode_feat_b64(str(raw.get("feat_b64") or ""))
+            encoded = str(raw.get("feat_b64") or "")
+            feature = decode_feat_b64(encoded)
             if not feature:
                 # 特征解码失败就跳过这张脸：宁可少认一个人，
                 # 也不能拿一段长度不对的向量去算相似度（会静默认错人）。
-                logger.warning("设备 %s 回传的人脸特征无法解码，已跳过", self.device_id)
+                logger.warning(
+                    "设备 %s 回传的人脸特征不可用（feat_b64 %s，feat_len=%s），已跳过这张脸",
+                    self.device_id,
+                    "缺失" if not encoded else f"{len(encoded)} 字符解不开",
+                    raw.get("feat_len"),
+                )
                 continue
             scan.faces.append(
                 FaceObservation(
