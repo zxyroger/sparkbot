@@ -257,6 +257,17 @@ class BehaviorSettings(BaseSettings):
     # 人对着板子说话 RMS 几百以上 —— 250 是两者之间的安全值。
     speech_min_rms: int = 250
 
+    #: 判定"有人在说话"需要的**有效语音分片数**（每片 20ms）。
+    #
+    # 这是一个"数量"门槛，不是电平门槛：说话会连续几百片超过能量值，
+    # 而键盘、风扇这类瞬态只贡献几片。实测安静房间 3.6 秒窗口里是 0~8 片，
+    # 正常说一句话是几十片以上 —— 默认 15（≈300ms）落在中间。
+    #
+    # 调法：日志里每轮都会打「语音分片 N/M」。
+    #   * 说了话却总是"按静音处理" → 往小调；
+    #   * 没说话却自己应答 → 往大调。
+    speech_min_chunks: int = 15
+
 
 class Settings(BaseSettings):
     """聚合配置根对象。"""
@@ -342,6 +353,7 @@ EDITABLE_FIELDS: dict[str, str] = {
     "behavior.voice_session_gap_s": "SPARKBOT_BEHAVIOR_VOICE_SESSION_GAP_S",
     "behavior.voice_session_idle_timeout_s": "SPARKBOT_BEHAVIOR_VOICE_SESSION_IDLE_TIMEOUT_S",
     "behavior.speech_min_rms": "SPARKBOT_BEHAVIOR_SPEECH_MIN_RMS",
+    "behavior.speech_min_chunks": "SPARKBOT_BEHAVIOR_SPEECH_MIN_CHUNKS",
     "memory.enabled": "SPARKBOT_MEMORY_ENABLED",
     "memory.max_injected": "SPARKBOT_MEMORY_MAX_INJECTED",
     "memory.auto_extract": "SPARKBOT_MEMORY_AUTO_EXTRACT",

@@ -35,14 +35,16 @@ from .perception.vision import VisionAnalyzer
 
 logger = logging.getLogger(__name__)
 
-#: 判定"有人在说话"需要的**有效语音分片数**（每片 20ms → 8 片 = 160ms）。
+#: 判定"有人在说话"需要的**有效语音分片数**默认值（每片 20ms → 15 片 ≈ 300ms）。
 #:
 #: 为什么用"片数"而不是整段 RMS：一个 3.6 秒的采集窗口里，用户往往只说
 #: 一两秒，整段 RMS 会被静音稀释 —— 实测用户正常说"峰值 5742 / RMS 140"，
 #: 而安静房间本身就"峰值 1444 / RMS 100"，两者在 RMS 上几乎分不开，
 #: 结果就是**用户说了话却被判成静音、机器人没反应**（用户原话："等好久没反应"）。
 #: 分片级别的能量计数没有这个问题：说话会连续几百片超门槛，瞬态噪声只有几片。
-VOICE_CHUNKS_MIN = 8
+#:
+#: 实际取值见 ``behavior.speech_min_chunks``（可运行期调整）。
+VOICE_CHUNKS_MIN_FALLBACK = 15
 
 
 @dataclass(slots=True)
@@ -419,6 +421,10 @@ class SparkBotRuntime:
         session = None
         buffered: list[bytes] = []
         voice_chunks = 0
+        min_chunks = max(1, int(
+            getattr(self.settings.behavior, "speech_min_chunks", VOICE_CHUNKS_MIN_FALLBACK)
+            or VOICE_CHUNKS_MIN_FALLBACK
+        ))
 
         async def feed(chunk: bytes) -> None:
             """采集回调（在采集协程里被 await，所以可以安全地连 ASR）。"""
@@ -443,7 +449,7 @@ class SparkBotRuntime:
             # 那样每个窗口都会连一次 ASR，既浪费又把服务端拖满。
             # 一个分片 20ms，8 片 = 160ms —— 人说话远不止这么长，
             # 而一次瞬态噪声远不到。
-            if voice_chunks < VOICE_CHUNKS_MIN:
+            if voice_chunks < min_chunks:
                 return
 
             if self.asr is None or not getattr(self.asr, "supports_streaming", False):
@@ -502,12 +508,14 @@ class SparkBotRuntime:
         # 在"叮"一声之后才开口，采样窗口很容易正好错过说话的部分。
         peak_now, rms_now = self._audio_level(pcm)
         logger.info(
-            "采集结果: %d 字节 ≈ %.2f 秒（%.0f 帧可识别，麦克风 峰值=%d RMS=%d）",
+            "采集结果: %d 字节 ≈ %.2f 秒（%.0f 帧可识别，麦克风 峰值=%d RMS=%d，"
+            "有效语音分片 %d）",
             len(pcm),
             len(pcm) / (rate * 2),
             len(pcm) / (rate * 2) * 100,
             peak_now,
             rms_now,
+            voice_chunks,
         )
 
         if not pcm:
@@ -547,11 +555,11 @@ class SparkBotRuntime:
         # VOICE_CHUNKS_MIN 的说明）；只看片数又可能被长时间的低频噪声蒙到，
         # 所以两条任一成立就算听到了。
         min_rms = max(0, int(self.settings.behavior.speech_min_rms))
-        heard = voice_chunks >= VOICE_CHUNKS_MIN or bool(min_rms and rms_now >= min_rms)
+        heard = voice_chunks >= min_chunks or bool(min_rms and rms_now >= min_rms)
         if not heard:
             result["stage"] = "silent"
             result["hint"] = (
-                f"没听到人声（有效语音分片 {voice_chunks}/{VOICE_CHUNKS_MIN}，"
+                f"没听到人声（有效语音分片 {voice_chunks}/{min_chunks}，"
                 f"RMS={rms_now}），按静音处理"
             )
             # **保持上行**：连续采集的关键 —— 静音期间不关麦克风，
@@ -559,7 +567,7 @@ class SparkBotRuntime:
             result["mic_open"] = True
             logger.info(
                 "本轮按静音处理（有效语音分片 %d/%d，RMS=%d 峰值=%d，未进 ASR）",
-                voice_chunks, VOICE_CHUNKS_MIN, rms_now, peak_now,
+                voice_chunks, min_chunks, rms_now, peak_now,
             )
             return result
 
@@ -844,7 +852,13 @@ class SparkBotRuntime:
         """
         if str(result.get("text") or "").strip():
             return True
-        if int(result.get("voice_chunks") or 0) >= VOICE_CHUNKS_MIN:
+        if int(result.get("voice_chunks") or 0) >= max(
+            1,
+            int(
+                getattr(self.settings.behavior, "speech_min_chunks", VOICE_CHUNKS_MIN_FALLBACK)
+                or VOICE_CHUNKS_MIN_FALLBACK
+            ),
+        ):
             return True
         return int(result.get("rms") or 0) >= max(0, int(self.settings.behavior.speech_min_rms))
 
