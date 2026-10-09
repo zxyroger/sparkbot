@@ -221,21 +221,41 @@ class BehaviorSettings(BaseSettings):
     # 会话历史保留条数。
     history_limit: int = 40
 
-    # 一次唤醒后连续对话的轮数。
+    # 一次唤醒后连续对话的**轮数上限**。
     #
-    # 为什么需要这个参数：设备只在收到 ``start_listen`` 时才上传音频，
+    # 为什么需要连续采集：设备只在收到 ``start_listen`` 时才上传音频，
     # 所以"采集一次 → 识别 → 回复 → 播报"这套流程走完就**停止录音**了。
     # 用户如果想接着说第二句，麦克风根本没在采集，自然没有回应 ——
     # 表现为"唤醒后只能对话一句"。
     #
-    # 设为 1 表示只回一句就停（旧行为）；大于 1 会在一轮结束后自动再采集，
-    # 让用户可以连续说几句而不用反复喊唤醒词。
-    voice_session_turns: int = 3
+    # 0 = **不限制**（默认），由 ``voice_session_idle_timeout_s`` 决定何时收工；
+    # 设为 1 表示只回一句就停（旧行为）。
+    voice_session_turns: int = 0
     # 连续对话中，两轮之间的等待时间（秒）。
     #
     # 必须留出这段时间：一是让设备的扬声器把话说完（否则麦克风会把
     # 机器人自己的声音当成用户输入），二是给用户一点反应时间。
     voice_session_gap_s: float = 1.2
+
+    # 「保持唤醒」：多久没听到人声就退出对话态、回到需要喊唤醒词的状态（秒）。
+    #
+    # 用户诉求是"唤醒一次就能一直说，安静几分钟后自动关闭" —— 默认 5 分钟。
+    # 会话期间麦克风一直开着（每轮 start_listen/stop_listen 循环），
+    # 所以"没听到人声"必须能可靠地判断，否则要么提前掉线、要么永远不退出。
+    #
+    # 0 = 关掉这个机制，退回由 ``voice_session_turns`` 控制的老行为。
+    voice_session_idle_timeout_s: float = 300.0
+
+    #: 「有声音」的电平门槛（16bit PCM 的 RMS）。
+    #
+    # 会话态下每轮都会走完整流程，而 ASR 对纯静音/环境噪声经常吐出一个
+    # 句点之类的**非空文本**，于是机器人会对着一片安静不停自言自语
+    # （实测每 5 秒插一句"我就守在这儿，没动～"）。所以在进 ASR 之前
+    # 先用麦克风电平挡一道：低于门槛就按静音处理，不识别、不回复。
+    #
+    # 实测本板（ES8311，输入增益 30 dB）：安静房间底噪 RMS≈100，
+    # 人对着板子说话 RMS 几百以上 —— 250 是两者之间的安全值。
+    speech_min_rms: int = 250
 
 
 class Settings(BaseSettings):
@@ -320,6 +340,8 @@ EDITABLE_FIELDS: dict[str, str] = {
     "behavior.history_limit": "SPARKBOT_BEHAVIOR_HISTORY_LIMIT",
     "behavior.voice_session_turns": "SPARKBOT_BEHAVIOR_VOICE_SESSION_TURNS",
     "behavior.voice_session_gap_s": "SPARKBOT_BEHAVIOR_VOICE_SESSION_GAP_S",
+    "behavior.voice_session_idle_timeout_s": "SPARKBOT_BEHAVIOR_VOICE_SESSION_IDLE_TIMEOUT_S",
+    "behavior.speech_min_rms": "SPARKBOT_BEHAVIOR_SPEECH_MIN_RMS",
     "memory.enabled": "SPARKBOT_MEMORY_ENABLED",
     "memory.max_injected": "SPARKBOT_MEMORY_MAX_INJECTED",
     "memory.auto_extract": "SPARKBOT_MEMORY_AUTO_EXTRACT",

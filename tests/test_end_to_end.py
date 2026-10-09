@@ -116,6 +116,10 @@ def build_settings() -> Settings:
     settings.behavior.max_angular_rps = 1.5
     settings.behavior.max_duration_ms = 4_000
     settings.behavior.min_command_interval_ms = 0
+    # 语音会话：端到端测试不跑"保持 5 分钟"，一轮就收工（等价于老行为），
+    # 否则唤醒事件会拉起一个几分钟的后台会话，跟后面的听音工具抢麦克风。
+    settings.behavior.voice_session_idle_timeout_s = 0.0
+    settings.behavior.voice_session_turns = 1
     return settings
 
 

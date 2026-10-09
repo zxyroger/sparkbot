@@ -27,7 +27,7 @@ from .core.events import EventBus
 from .core.tools import ToolRegistry
 from .device.capabilities import RobotProvider
 from .device.gateway import DeviceGateway
-from .device.protocol import EventName
+from .device.protocol import Emotion, EventName
 from .llm.base import LLMProvider, create_provider
 from .perception.face import get_face_db
 from .perception.speech import ASRProvider, TTSProvider, create_asr, create_tts
@@ -50,6 +50,8 @@ class RuntimeStatus:
     agents: int
     voice_loop: bool
     uptime_s: float
+    #: 当前是否处于「对话态」（唤醒后保持聆听、不必再喊唤醒词）。
+    voice_session: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """转成可 JSON 序列化字典。"""
@@ -64,6 +66,7 @@ class RuntimeStatus:
             "agents": self.agents,
             "voice_loop": self.voice_loop,
             "uptime_s": round(self.uptime_s, 1),
+            "voice_session": self.voice_session,
         }
 
 
@@ -132,6 +135,9 @@ class SparkBotRuntime:
         self.bus = EventBus()
         self.started_at = time.time()
         self._voice_task: asyncio.Task[None] | None = None
+        #: 是否处于「对话态」（一次唤醒后保持聆听，直到安静超时）。
+        #: 只用于状态展示与排查：用户问"现在还要不要喊唤醒词"时看它。
+        self.voice_session_active = False
 
         # --- 设备层 ---------------------------------------------------- #
         self.gateway = DeviceGateway(
@@ -308,8 +314,15 @@ class SparkBotRuntime:
                     await asyncio.sleep(0.5)
 
 
-    async def voice_turn(self, device_id: str | None = None) -> dict[str, Any]:
+    async def voice_turn(
+        self, device_id: str | None = None, *, beep: bool = True
+    ) -> dict[str, Any]:
         """完成一次完整的语音交互，并返回各阶段结果。
+
+        Args:
+            device_id: 目标设备；``None`` 表示当前唯一在线设备。
+            beep: 开始采集前是否"叮"一声提示可以说话了。会话态里只有第一轮
+                需要 —— 每轮都响会变成噪音（见 ``_handle_voice_turn``）。
 
         成功时返回的字典包含：
 
@@ -344,7 +357,7 @@ class SparkBotRuntime:
 
         # 即时反馈：先"叮"一声，让用户知道可以说话了。
         # 这一声很关键 —— 没有它，用户不知道什么时候该开口。
-        if robot.has("speaker"):
+        if beep and robot.has("speaker"):
             with contextlib.suppress(SparkBotError):
                 await robot.play_tone(frequency_hz=880.0, duration_ms=90)
 
@@ -431,6 +444,21 @@ class SparkBotRuntime:
             logger.warning(result["error"])
             return result
 
+        # 语音门槛：电平低于门槛就按静音处理，**不进 ASR、也不回复**。
+        #
+        # 为什么必须挡：会话态下每轮都会走完整流程，而 ASR 对静音/环境噪声
+        # 经常吐出一个句点之类的非空文本，于是机器人会对着一片安静不停
+        # 自言自语（实测每 5 秒插一句"我就守在这儿，没动～"）。
+        # 按电平挡掉最直接，也顺带省掉一次识别 + 一次模型调用。
+        min_rms = max(0, int(self.settings.behavior.speech_min_rms))
+        if min_rms and rms_now < min_rms:
+            result["stage"] = "silent"
+            result["hint"] = f"低于语音门槛（RMS {rms_now} < {min_rms}），按静音处理"
+            logger.info(
+                "本轮按静音处理（RMS=%d 峰值=%d，未进 ASR）", rms_now, peak
+            )
+            return result
+
         try:
             if streamed_text.strip():
                 # 流式链路已经出文本：不再重复识别，直接进对话。
@@ -511,42 +539,123 @@ class SparkBotRuntime:
         return peak, rms
 
     async def _handle_voice_turn(self, device_id: str | None) -> None:
-        """一次唤醒后的**语音会话**：连续听若干轮。
+        """一次唤醒后的**语音会话**：保持"对话态"，直到安静足够久。
 
-        为什么要循环而不是只跑一轮：设备只在收到 ``start_listen`` 时上传
-        音频。跑完"采集 → 识别 → 回复 → 播报"之后录音就停了，用户接着说
-        第二句时麦克风根本没开，因此**没有任何回应** —— 这正是
-        "唤醒后只能对话一句"的原因。
+        设备只在收到 ``start_listen`` 时才上传音频，所以"采集 → 识别 →
+        回复 → 播报"跑完录音就停了；用户再说第二句时麦克风根本没开，
+        自然没有回应 —— 这就是"唤醒后只能对话一句"。
+        这里在每轮结束后自动再开一轮采集，把"唤醒态"保持住。
 
-        这里在一轮结束后自动再采集，轮数由 ``behavior.voice_session_turns``
-        控制。任何一轮没听到人声就结束会话（用户走开了，不必空等下N轮）。
+        结束条件（任一满足）：
+
+        * 连续 ``behavior.voice_session_idle_timeout_s`` 秒没听到人声
+          （默认 300 秒 = 5 分钟）→ 退出对话态，回到"要喊唤醒词"的状态；
+        * 轮数达到 ``behavior.voice_session_turns``（0 = 不限）；
+        * 出错（设备掉线等）。
+
+        关键细节："没听清"不等于"没说话"。识别结果为空、但麦克风电平明显
+        有语音时，仍然算用户在说话、照样续期 —— 否则一句话被 ASR 听漏，
+        会话就当场结束，用户会觉得"又只能问一句"。
         """
-        turns = max(1, int(self.settings.behavior.voice_session_turns))
+        behavior = self.settings.behavior
+        idle_timeout = max(0.0, float(behavior.voice_session_idle_timeout_s))
+        turn_cap = max(0, int(behavior.voice_session_turns))
+        gap = max(0.0, float(behavior.voice_session_gap_s))
 
-        for i in range(turns):
-            result = await self.voice_turn(device_id)
+        self.voice_session_active = True
+        last_voice_at = time.monotonic()
+        rounds = 0
+        consecutive_errors = 0
+        logger.info(
+            "语音会话开始（静音 %.1f 秒后退出，轮数上限 %s）",
+            idle_timeout,
+            turn_cap or "不限",
+        )
+        try:
+            while True:
+                # 只有第一轮"叮"一声：会话态里每轮都响会变成噪音。
+                result = await self.voice_turn(device_id, beep=(rounds == 0))
+                rounds += 1
 
-            # 出错、没听到人声、识别为空 —— 都直接结束本次会话。
-            # 继续空等只会让设备一直开麦，还可能把环境噪音当成输入。
-            #
-            # stage 取值（见 voice_turn）：done / no_reply 视为这一轮成立；
-            # no_speech / silent / empty_text / recorded / transcribed
-            # 都意味着没有拿到可用的用户语音。
-            if result.get("error") or result.get("stage") not in ("done", "no_reply"):
-                if i > 0:
-                    logger.info("连续对话结束（第 %d 轮无有效语音: %s）",
-                                i + 1, result.get("stage"))
-                return
+                if result.get("error"):
+                    # 偶发失败（一次上行丢包、设备正忙）不该直接掐掉整段会话，
+                    # 连续多次才认输 —— 否则用户会莫名"被退出对话态"。
+                    consecutive_errors += 1
+                    logger.info(
+                        "语音会话第 %d 轮出错（连续 %d 次）：%s",
+                        rounds, consecutive_errors, result.get("error"),
+                    )
+                    if consecutive_errors >= 3:
+                        break
+                    await asyncio.sleep(gap)
+                    continue
+                consecutive_errors = 0
 
-            if i + 1 >= turns:
-                return
+                heard = self._heard_speech(result)
+                if heard:
+                    last_voice_at = time.monotonic()
+                elif idle_timeout <= 0:
+                    # 老行为：静音一轮就收工（voice_session_turns 模式）
+                    if rounds > 1:
+                        logger.info("连续对话结束（第 %d 轮没听到人声: %s）",
+                                    rounds, result.get("stage"))
+                    break
 
-            # 轮间等待：让扬声器把话说完，并给用户反应时间。
-            # 不留这段时间的话，麦克风会把机器人自己的声音收进去，
-            # 变成"自己跟自己说话"。
-            gap = float(self.settings.behavior.voice_session_gap_s)
-            logger.info("连续对话：第 %d/%d 轮结束，%.1fs 后继续听…", i + 1, turns, gap)
-            await asyncio.sleep(gap)
+                if turn_cap and rounds >= turn_cap:
+                    break
+
+                quiet_for = time.monotonic() - last_voice_at
+                if idle_timeout > 0 and quiet_for >= idle_timeout:
+                    logger.info(
+                        "语音会话结束：已安静 %.0f 秒（共 %d 轮），回到等待唤醒词",
+                        quiet_for, rounds,
+                    )
+                    break
+
+                # 轮间等待：让扬声器把话说完，并给用户反应时间。
+                # 不留这段时间的话，麦克风会把机器人自己的声音收进去，
+                # 变成"自己跟自己说话"。
+                #
+                # 但**没听到人声的那一轮不用等**：那一轮根本没有播报，
+                # 不存在回声风险；等满 1.2 秒只会制造一段"听不见你说话"的
+                # 盲区 —— 用户恰好在这段开口时，前半句就被切掉了。
+                await asyncio.sleep(gap if heard else gap * 0.15)
+        finally:
+            self.voice_session_active = False
+            await self._close_voice_session(device_id)
+
+    def _heard_speech(self, result: dict[str, Any]) -> bool:
+        """这一轮是否"听到了人在说话"。
+
+        判据有两个，满足其一即可：
+        * ASR 出了非空文本 —— 正常情况；
+        * 麦克风电平明显高于底噪 —— ASR 听漏了也不算"没人说话"。
+
+        实测本板（ES8311，输入增益 30 dB）：安静房间 RMS≈100，
+        人对着板子说话 RMS 几百以上，所以门槛取 300。
+        """
+        if str(result.get("text") or "").strip():
+            return True
+        return int(result.get("rms") or 0) >= max(
+            0, int(self.settings.behavior.speech_min_rms)
+        )
+
+    async def _close_voice_session(self, device_id: str | None) -> None:
+        """退出对话态时给一个**看得见**的提示。
+
+        为什么不只打日志：用户在跟机器人说话时看不到日志，会话静默结束
+        他只会觉得"怎么又不理我了"。表情切到 sleepy 是个不吵人的信号 ——
+        半夜里"叮"一声反而吓人。没有显示屏的设备就只记日志。
+        """
+        try:
+            robot = self.robots.get(device_id)
+        except DeviceOfflineError:
+            return
+        if not robot.has("display"):
+            return
+        with contextlib.suppress(SparkBotError, DeviceOfflineError):
+            await robot.set_face(Emotion.SLEEPY, intensity=0.6)
+            logger.info("对话态已关闭：表情切到 sleepy，等待下一次唤醒")
 
     # ------------------------------------------------------------------ #
     # 维护
@@ -720,6 +829,7 @@ class SparkBotRuntime:
             agents=len(self.agents.all()),
             voice_loop=self._voice_task is not None and not self._voice_task.done(),
             uptime_s=time.time() - self.started_at,
+            voice_session=self.voice_session_active,
         )
 
     def tools_catalog(self) -> list[dict[str, Any]]:

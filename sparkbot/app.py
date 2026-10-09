@@ -1626,7 +1626,8 @@ async function refreshStatus() {
       })
     ]);
     pill.textContent =
-      `LLM ${s.llm_provider}/${s.llm_model} · 工具 ${s.tools} · 语音 ${s.voice_loop ? "开" : "关"}`;
+      `LLM ${s.llm_provider}/${s.llm_model} · 工具 ${s.tools} · 语音 ${
+        s.voice_loop ? (s.voice_session ? "开·对话中" : "开") : "关"}`;
     // 成功时清掉失败留下的红色标记，否则一旦失败过一次就永远是红的。
     pill.className = "pill";
     // telemetry 可能是 null（设备刚连上还没上报），用可选链兜住，

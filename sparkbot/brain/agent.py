@@ -1127,7 +1127,9 @@ class Agent:
             ):
                 await self._speak_segments(robot, segments, full_text=turn.reply.strip())
             elif len(segments) == 1:
-                await self._speak_segment(robot, segments[0])
+                # 一定要等播完：不等的话 run() 会在喇叭还响着的时候返回，
+                # 紧接着的下一轮采集会把机器人自己的声音录成"用户说话"。
+                await self._speak_segment(robot, segments[0], wait=True)
             else:
                 await self._speak_segments(robot, segments)
         except SparkBotError as exc:
@@ -1136,7 +1138,13 @@ class Agent:
             logger.exception("播报异常: %s", exc)
 
     async def _speak_segment(self, robot: Robot, text: str, *, wait: bool = False) -> None:
-        """合成一段并下发；``wait=True`` 时等到设备真的播完再返回。"""
+        """合成一段并下发；``wait=True`` 时等到设备真的播完再返回。
+
+        ``wait`` 默认 False（不阻塞）只适合"后面不会再听麦克风"的场合。
+        语音闭环里必须传 True —— 实测不等播完时，下一轮采集会把机器人
+        自己的话录进去（第二轮识别出「次好吗？」，正是上一句
+        "你再说一次好吗？"的尾巴），于是它开始跟自己聊天。
+        """
         t0 = time.monotonic()
         audio, fmt = await self.ctx.tts.synthesize(text)
         logger.info("播报: 合成完成 %d 字节 fmt=%s 耗时=%.0fms（%d 字）",
@@ -1250,6 +1258,9 @@ class Agent:
 
         固件的 ``play_audio`` 是"新语音打断旧语音"，所以必须等 ``audio_done``；
         代价是段间有一次网络往返的空隙。设备不支持流式时走这条路。
+
+        最后一段同样要等（原来只等倒数第二段）：播报没结束就返回，
+        下一轮采集会把机器人自己的声音收进来 —— 见 :meth:`_speak_segment`。
         """
         pending = asyncio.create_task(self.ctx.tts.synthesize(segments[0]))
         for i in range(len(segments)):
@@ -1263,14 +1274,12 @@ class Agent:
                                i + 1, len(segments))
                 continue
 
-            last = i + 1 >= len(segments)
             t0 = time.monotonic()
-            result = await robot.say(audio, fmt=fmt, wait=not last)
+            result = await robot.say(audio, fmt=fmt, wait=True)
             logger.info(
                 "播报: 第 %d/%d 段 %d 字节，耗时=%.0fms%s",
                 i + 1, len(segments), len(audio), (time.monotonic() - t0) * 1000,
-                "" if last else ("（已播完）" if result.get("done")
-                                 else "（等待超时，按估算时长继续）"),
+                "（已播完）" if result.get("done") else "（等待超时，按估算时长继续）",
             )
 
     # ------------------------------------------------------------------ #
