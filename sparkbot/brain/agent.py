@@ -366,6 +366,12 @@ MAX_SPEECH_SEGMENT_CHARS = 60
 
 #: 流式播报每块 PCM 的字节数（4096 = 2048 采样 = 128ms 音频）。
 #: 太小会让命令往返次数暴增，太大则首块延迟变大、单条消息也更大。
+#:
+#: 2026-10 实测：改大（32KB）能改善"喂入被设备回包延迟拖死"，但**本板
+#: 上仍然会呲呲**——因为播放任务本身会被常开麦克风/摄像头推流挤饿，
+#: 播放环一旦抽干就是"呲呲"。所以多段回复不再走流式（见 _announce），
+#: 这个常量只在显式打开 speech.tts_stream_playback 时才起作用。
+#: 要真正解决，得动固件：播放环 64KB→更大、热路径别逐条指令打日志。
 STREAM_CHUNK_BYTES = 4096
 
 #: 流式播报要求的采样率 —— 固件就是按 16kHz 播的，不做重采样。
@@ -1225,8 +1231,15 @@ class Agent:
                     len(turn.reply), len(segments), robot.device_id)
         try:
             # 走哪条下发路径由配置决定（见 speech.tts_stream_playback）：
-            #   * 默认整段下发 —— 老路径，实测音频最干净；
-            #   * 打开开关才走流式下发 —— 首字延迟低，但在本板上有可闻杂音。
+            #   * 默认逐段**整段**下发 —— 老路径，实测音频最干净；
+            #   * 打开开关才走真流式下发 —— 首字延迟低、段落之间不断流，
+            #     但在本板上有可闻杂音（"呲呲"），实测与负载无关地复现过。
+            #
+            # 多段回复为什么不用流式：见 STREAM_CHUNK_BYTES 那段 —— 流式是
+            # "每 4KB 一条 command 且每条都等设备回包"，设备回包一抖（实测
+            # 0.5–2.4s）喂入就掉到实时速度以下，播放环抽干 = 一句一顿 + 呲呲。
+            # 逐段整段下发一条消息推一段，只受"新语音打断旧语音"约束，代价
+            # 是段间留一次网络往返的空隙，但每个字都是干净的。
             if (
                 self.settings.speech.tts_stream_playback
                 and getattr(self.ctx.tts, "supports_streaming", False)
@@ -1237,7 +1250,9 @@ class Agent:
                 # 紧接着的下一轮采集会把机器人自己的声音录成"用户说话"。
                 await self._speak_segment(robot, segments[0], wait=True)
             else:
-                await self._speak_segments(robot, segments)
+                # 多段但没开流式：逐段整段下发（每段一次往返，等播完再发下
+                # 一段）。段间会多一次网络空隙，但不会因为回包抖动而断流。
+                await self._speak_segments_sequential(robot, segments)
         except SparkBotError as exc:
             logger.warning("播报失败: %s", exc.message)
         except Exception as exc:  # noqa: BLE001 - 这里出错不该让对话失败
