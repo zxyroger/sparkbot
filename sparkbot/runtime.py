@@ -394,11 +394,20 @@ class SparkBotRuntime:
         result["stage"] = "recorded"
         result["chunks"] = getattr(robot, "last_audio_chunks", None)
 
+        # 峰值与 RMS 在这里就算出来并打进日志：它们是判断"人声到底有没有
+        # 进麦克风"最直接的两个数 —— 唤醒不灵、识别听不清时先看这两个。
+        # 参考值：安静房间底噪 RMS≈100、峰值≈200；对着板子正常说话是几千。
+        #
+        # 刻意**不用** _peak_amplitude()：它只看开头 0.25 秒，而用户往往
+        # 在"叮"一声之后才开口，采样窗口很容易正好错过说话的部分。
+        peak_now, rms_now = self._audio_level(pcm)
         logger.info(
-            "采集结果: %d 字节 ≈ %.2f 秒（%.0f 帧可识别）",
+            "采集结果: %d 字节 ≈ %.2f 秒（%.0f 帧可识别，麦克风 峰值=%d RMS=%d）",
             len(pcm),
             len(pcm) / (rate * 2),
             len(pcm) / (rate * 2) * 100,
+            peak_now,
+            rms_now,
         )
 
         if not pcm:
@@ -413,8 +422,9 @@ class SparkBotRuntime:
             return result
 
         # 能量检查：全零或极弱说明麦克风没真正工作，与"用户没说话"是两回事。
-        peak = self._peak_amplitude(pcm)
+        peak = peak_now
         result["peak"] = peak
+        result["rms"] = rms_now
         if peak < 200:
             result["stage"] = "silent"
             result["error"] = f"采集到的音频几乎全静音（峰值 {peak}）—— 麦克风可能没在工作"
@@ -472,6 +482,33 @@ class SparkBotRuntime:
         if not samples:
             return 0
         return max(abs(s) for s in samples)
+
+    @staticmethod
+    def _audio_level(pcm: bytes) -> tuple[int, int]:
+        """算整段 PCM 的 ``(峰值, RMS)``，用来判断人声有没有进麦克风。
+
+        为什么不用 :meth:`_peak_amplitude`：它只看开头 0.25 秒，
+        而用户通常等"叮"响过之后才开口，采样窗口很容易整段都是静音，
+        于是"电平正常"和"麦克风坏了"分不出来。
+
+        参考值（实测本板 ES8311，输入增益 30 dB）：
+        * 安静房间底噪：峰值 ≈200，RMS ≈100
+        * 喇叭在 10cm 处放测试音：峰值 ≈2200，RMS ≈1030
+        * 人对着板子正常说话：峰值几千（低于 1000 基本就是说得太轻或太远）
+        """
+        import array
+        import math
+
+        usable = len(pcm) - (len(pcm) % 2)
+        if usable <= 0:
+            return 0, 0
+        samples = array.array("h")
+        samples.frombytes(pcm[:usable])
+        if not samples:
+            return 0, 0
+        peak = max(abs(s) for s in samples)
+        rms = int(math.sqrt(sum(s * s for s in samples) / len(samples)))
+        return peak, rms
 
     async def _handle_voice_turn(self, device_id: str | None) -> None:
         """一次唤醒后的**语音会话**：连续听若干轮。

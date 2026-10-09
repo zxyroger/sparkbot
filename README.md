@@ -563,6 +563,65 @@ python tests/test_face_recognition.py     # 34 条断言：相似度、绑定、
 
 ---
 
+## 机器人回「我的大脑有点连不上」？
+
+这是**模型调用失败**的兜底回复。先看服务日志里那条 provider 报错：
+
+```powershell
+Select-String -Path logs\server_live.err.log -Pattern "provider 失败" | Select-Object -Last 3
+```
+
+### 如果是 HTTP 400 + `role 'tool' must be a response to ... 'tool_calls'`
+
+会话历史里出现了**孤儿 `tool` 消息**：带 `tool_calls` 的 assistant 消息被
+历史裁剪丢掉了，它的工具回复却留着。OpenAI/DeepSeek 会直接拒掉整个请求。
+
+这条极难自己想到，因为现象跟"模型连不上"一模一样：唤醒、录音、识别全都正常，
+只有回答变成"我的大脑有点连不上"，很容易误判成网络问题或唤醒坏了。
+
+根因是会话记忆用定长 `deque` **逐条**裁历史。现在 `Memory.messages()` 会先做
+一遍配对整理（`_sanitized`）：孤儿 tool 回复、以及没收到回复的 `tool_calls`
+整组丢掉。宁可少一轮上下文，也不让模型调用失败。
+
+回归测试：`python tests/test_chat_memory.py`（8 条断言，覆盖两个方向 + 正常历史不受影响）。
+
+### 如果是超时 / 连接被拒
+
+先确认这台机器能不能访问模型 API（本机实测过 GitHub 会解析到被墙的 IP，
+模型 API 也可能遇到同类问题）：
+
+```powershell
+curl.exe -sS -m 10 -o NUL -w "%{http_code}`n" https://api.deepseek.com
+```
+
+## 语音唤醒不灵时按这个顺序查
+
+唤醒检测在**设备本地**跑（esp-sr WakeNet），PC 只负责收到 `wake_word` 事件后
+开始采集。所以先分清是"没喊中"还是"喊中了但没反应"：
+
+1. **看设备有没有命中**。串口里搜 `唤醒词命中`；或者调
+   `POST /api/action {"action":"wakeword_dump"}` 直接打印
+   `feed / 命中 / 丢弃` 计数。`feed` 在涨、`丢弃=0` 说明检测器是活的。
+2. **喊的词对不对**。当前模型是 `wn9_hixiaoxing_tts`，**只认「Hi,小星」**
+   （英文 Hi + 中文小星）。「你好小星」「小星」「嗨小星」都不会触发。
+3. **人声电平够不够**。每轮采集都会打一行
+   `采集结果: ... 麦克风 峰值=N RMS=M`：
+
+   | 场景 | 峰值 | RMS |
+   |---|---|---|
+   | 安静房间底噪 | ~200 | ~100 |
+   | 喇叭在 10cm 处放测试音 | ~2200 | ~1030 |
+   | 对板子正常说话 | 几千 | 几百以上 |
+
+   峰值长期低于 1000，说明说得太轻或离得太远：要么凑近到 30~60cm，
+   要么把 `SPARKBOT_AUDIO_MIC_GAIN_DB` 从 30 调到 36（ES8311 支持
+   0/6/12/18/24/30/36/42 档）。
+4. **别在机器人说话时喊**。播报期间会忽略唤醒（回声自触发保护），
+   而且一次唤醒会连续听 3 轮、每轮十几秒，这段时间麦克风本来就是开着的，
+   直接说话即可。想让它立刻停下来听你说，把 `behavior.voice_session_turns` 调小。
+
+---
+
 ## 接真板子的验证顺序
 
 建议按这个顺序排查，每步只验证一件事：
