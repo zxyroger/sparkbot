@@ -166,6 +166,14 @@ class OpenAIProvider(LLMProvider):
             prompt_tokens=int(raw_usage.get("prompt_tokens", 0) or 0),
             completion_tokens=int(raw_usage.get("completion_tokens", 0) or 0),
             total_tokens=int(raw_usage.get("total_tokens", 0) or 0),
+            # 上下文缓存命中量：DeepSeek 用 prompt_cache_hit_tokens，
+            # OpenAI 用 prompt_tokens_details.cached_tokens，两个都认。
+            cache_hit_tokens=int(
+                raw_usage.get("prompt_cache_hit_tokens")
+                or (raw_usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+                or 0
+            ),
+            cache_miss_tokens=int(raw_usage.get("prompt_cache_miss_tokens") or 0),
         )
 
         return LLMResponse(

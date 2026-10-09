@@ -280,6 +280,8 @@ class AgentTurn:
                 "prompt_tokens": self.usage.prompt_tokens,
                 "completion_tokens": self.usage.completion_tokens,
                 "total_tokens": self.usage.total_tokens,
+                "cache_hit_tokens": self.usage.cache_hit_tokens,
+                "cache_miss_tokens": self.usage.cache_miss_tokens,
             },
             "rounds": self.rounds,
             "duration_ms": self.duration_ms,
@@ -514,6 +516,9 @@ class Agent:
             "8. 用户说的话**已经由系统自动转成文字给你了**。不要为了"
             "「听清一点」「确认能不能听见」「再听一遍」去调用 listen —— "
             "那会让用户白白多等五六秒。只有用户明确说「你来听我说」时才用它。\n"
+            "9. 你的回复**会被系统自动播报出来**，所以不要为了让机器人说话而"
+            "调用 speak；那会把同一句话说两遍，还各花好几秒。只有需要额外说"
+            "一句**回复之外**的内容（例如朗读一段识别结果）时才用。\n"
         )
 
     def _device_context(self) -> str:
@@ -995,6 +1000,17 @@ class Agent:
             self._auto_bind_face(user_text, face_scan)
 
             if turn.reply:
+                # 每轮都把用量打进日志：判断"token 是不是烧得快"要有数，
+                # 而且能看到其中多少是**缓存命中**（便宜约一个数量级）。
+                logger.info(
+                    "本轮用量: 提示 %d（缓存命中 %d / 未命中 %d）+ 生成 %d = %d tokens，%d 轮工具",
+                    turn.usage.prompt_tokens,
+                    turn.usage.cache_hit_tokens,
+                    turn.usage.cache_miss_tokens,
+                    turn.usage.completion_tokens,
+                    turn.usage.total_tokens,
+                    turn.rounds,
+                )
                 self.bus.publish(
                     "agent.reply",
                     device_id=self.device_id,
@@ -1148,6 +1164,19 @@ class Agent:
 
         if not turn.reply:
             return
+
+        # 模型有时会用 speak 工具把**回复原文**念一遍。我们的自动播报再来一遍，
+        # 用户就听到同一句话说两次，而且每次合成+播放要好几秒（实测一次对话
+        # 因此从 1.5 秒涨到 12 秒）。内容一样就只让它说一遍。
+        reply_text = turn.reply.strip()
+        for invocation in turn.tool_invocations:
+            if invocation.name != "speak" or not invocation.ok:
+                continue
+            said = str((invocation.arguments or {}).get("text") or "").strip()
+            if said and (said == reply_text or said in reply_text or reply_text in said):
+                logger.info("本轮已用 speak 说过同样的内容，跳过自动播报（避免说两遍）")
+                announce = False
+                break
 
         if self.settings.behavior.talking_animation:
             explicit = any(t.name == "show_emotion" and t.ok for t in turn.tool_invocations)

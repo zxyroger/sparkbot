@@ -122,12 +122,22 @@ class Usage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    #: 命中**上下文缓存**的提示 token 数。
+    #:
+    #: 为什么单独记：我们的前缀（工具 schema + 人格准则 ≈ 2k token）每轮都
+    #: 一模一样地重发，DeepSeek 这类服务会按缓存价计费（便宜约一个数量级）。
+    #: 不把它记下来的话，"token 消耗快不快"根本判断不了 —— 看着 prompt_tokens
+    #: 很大，实际大部分可能是缓存价。
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
 
     def __add__(self, other: Usage) -> Usage:
         return Usage(
             prompt_tokens=self.prompt_tokens + other.prompt_tokens,
             completion_tokens=self.completion_tokens + other.completion_tokens,
             total_tokens=self.total_tokens + other.total_tokens,
+            cache_hit_tokens=self.cache_hit_tokens + other.cache_hit_tokens,
+            cache_miss_tokens=self.cache_miss_tokens + other.cache_miss_tokens,
         )
 
 
