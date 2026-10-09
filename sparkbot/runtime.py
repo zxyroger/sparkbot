@@ -35,6 +35,15 @@ from .perception.vision import VisionAnalyzer
 
 logger = logging.getLogger(__name__)
 
+#: 判定"有人在说话"需要的**有效语音分片数**（每片 20ms → 8 片 = 160ms）。
+#:
+#: 为什么用"片数"而不是整段 RMS：一个 3.6 秒的采集窗口里，用户往往只说
+#: 一两秒，整段 RMS 会被静音稀释 —— 实测用户正常说"峰值 5742 / RMS 140"，
+#: 而安静房间本身就"峰值 1444 / RMS 100"，两者在 RMS 上几乎分不开，
+#: 结果就是**用户说了话却被判成静音、机器人没反应**（用户原话："等好久没反应"）。
+#: 分片级别的能量计数没有这个问题：说话会连续几百片超门槛，瞬态噪声只有几片。
+VOICE_CHUNKS_MIN = 8
+
 
 @dataclass(slots=True)
 class RuntimeStatus:
@@ -409,19 +418,32 @@ class SparkBotRuntime:
         # 静音轮则完全不连 ASR、不进模型、不花钱。
         session = None
         buffered: list[bytes] = []
+        voice_chunks = 0
 
         async def feed(chunk: bytes) -> None:
             """采集回调（在采集协程里被 await，所以可以安全地连 ASR）。"""
-            nonlocal session
+            nonlocal session, voice_chunks
             if session is not None:
                 await session.push(chunk)
                 return
 
             buffered.append(chunk)
-            if not self._chunk_has_voice(chunk):
+            if self._chunk_has_voice(chunk):
+                voice_chunks += 1
+            else:
                 # 静音期间只留最近 1 秒，避免长静音把内存撑大
                 while sum(len(item) for item in buffered) > rate * 2:
                     buffered.pop(0)
+                return
+
+            # **连续**够多片才算"有人在说话"。
+            #
+            # 不能一有尖峰就连：键盘敲一下、风扇抖一下都会让某一两片超过
+            # 能量门槛（实测安静窗口的峰值能到 1444~6871，但 RMS 只有 100 上下），
+            # 那样每个窗口都会连一次 ASR，既浪费又把服务端拖满。
+            # 一个分片 20ms，8 片 = 160ms —— 人说话远不止这么长，
+            # 而一次瞬态噪声远不到。
+            if voice_chunks < VOICE_CHUNKS_MIN:
                 return
 
             if self.asr is None or not getattr(self.asr, "supports_streaming", False):
@@ -502,6 +524,7 @@ class SparkBotRuntime:
 
         result["peak"] = peak_now
         result["rms"] = rms_now
+        result["voice_chunks"] = voice_chunks
 
         # 全零 = 麦克风真的没在工作，与"用户没说话"是两回事。
         # 注意门槛从"峰值 <200"改成"== 0"：连续采集下每轮只有 ~1.5 秒，
@@ -519,15 +542,24 @@ class SparkBotRuntime:
         # 经常吐出一个句点之类的非空文本，于是机器人会对着一片安静不停
         # 自言自语（实测每 5 秒插一句"我就守在这儿，没动～"）。
         # 按电平挡掉最直接，也顺带省掉一次识别 + 一次模型调用。
+        # "有人说话"的判据：**分片级能量计数为主，整段 RMS 为辅**。
+        # 只看 RMS 会把"说了几句、中间有停顿"的正常语音判成静音（见
+        # VOICE_CHUNKS_MIN 的说明）；只看片数又可能被长时间的低频噪声蒙到，
+        # 所以两条任一成立就算听到了。
         min_rms = max(0, int(self.settings.behavior.speech_min_rms))
-        if session is None or (min_rms and rms_now < min_rms):
+        heard = voice_chunks >= VOICE_CHUNKS_MIN or bool(min_rms and rms_now >= min_rms)
+        if not heard:
             result["stage"] = "silent"
-            result["hint"] = f"低于语音门槛（RMS {rms_now} < {min_rms}），按静音处理"
+            result["hint"] = (
+                f"没听到人声（有效语音分片 {voice_chunks}/{VOICE_CHUNKS_MIN}，"
+                f"RMS={rms_now}），按静音处理"
+            )
             # **保持上行**：连续采集的关键 —— 静音期间不关麦克风，
             # 下一轮立刻接着听，用户不会遇到"刚好开口时前半句被吃掉"。
             result["mic_open"] = True
             logger.info(
-                "本轮按静音处理（RMS=%d 峰值=%d，未进 ASR）", rms_now, peak_now
+                "本轮按静音处理（有效语音分片 %d/%d，RMS=%d 峰值=%d，未进 ASR）",
+                voice_chunks, VOICE_CHUNKS_MIN, rms_now, peak_now,
             )
             return result
 
@@ -536,6 +568,24 @@ class SparkBotRuntime:
         # （实测第二轮识别出"次好吗？"，正是上一句的尾巴）。
         await self._stop_device_audio(robot)
         result["mic_open"] = False
+
+        # 流式识别给了文本、但**没有实词**（"."、"。。" 这类）时，用整段识别
+        # 复核一遍再决定。ASR 面对噪声常常吐出这种"非空但没内容"的结果，
+        # 直接喂给模型它就会顺着往下编（实测机器人对着空气答"嗯，我在听着呢"）。
+        if streamed_text.strip() and not self._text_is_meaningful(streamed_text):
+            logger.info("流式识别结果没有实词（%r），用整段识别复核", streamed_text[:16])
+            with contextlib.suppress(SparkBotError):
+                confirm = await self.asr.transcribe(pcm, sample_rate=rate)
+                if self._text_is_meaningful(confirm.text):
+                    streamed_text = confirm.text
+
+        if streamed_text.strip() and not self._text_is_meaningful(streamed_text):
+            # 复核后仍然没有实词：当成"没听清"，不回复、继续听。
+            # 这里**不设置 error**：会话继续，不打断"保持唤醒"。
+            result["stage"] = "garbled"
+            result["hint"] = f"识别结果没有实词（{streamed_text[:16]!r}），不回复"
+            logger.info("本轮按「没听清」处理：%r（不上报给模型）", streamed_text[:24])
+            return result
 
         try:
             if streamed_text.strip():
@@ -615,6 +665,20 @@ class SparkBotRuntime:
         peak = max(abs(s) for s in samples)
         rms = int(math.sqrt(sum(s * s for s in samples) / len(samples)))
         return peak, rms
+
+    @staticmethod
+    def _text_is_meaningful(text: str) -> bool:
+        """识别结果里有没有**实词**（至少一个汉字或字母数字）。
+
+        为什么不只看"非空"：ASR 面对噪声/静音经常回一个句点（"."）、
+        省略号之类 —— 那是非空文本，喂给模型它就会顺着编一句
+        （实测机器人对着空气答"嗯，我在听着呢，慢慢说～"）。
+        判据刻意放宽到"一个字符"：用户答"好""嗯"都算数。
+        """
+        for ch in text or "":
+            if ch.isalnum() or "\u4e00" <= ch <= "\u9fff":
+                return True
+        return False
 
     @staticmethod
     def _chunk_has_voice(pcm: bytes, *, threshold: int = 500) -> bool:
@@ -780,9 +844,9 @@ class SparkBotRuntime:
         """
         if str(result.get("text") or "").strip():
             return True
-        return int(result.get("rms") or 0) >= max(
-            0, int(self.settings.behavior.speech_min_rms)
-        )
+        if int(result.get("voice_chunks") or 0) >= VOICE_CHUNKS_MIN:
+            return True
+        return int(result.get("rms") or 0) >= max(0, int(self.settings.behavior.speech_min_rms))
 
     async def _close_voice_session(self, device_id: str | None) -> None:
         """退出对话态时给一个**看得见**的提示。
