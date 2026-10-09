@@ -149,6 +149,13 @@ class SparkBotRuntime:
         #: 是否处于「对话态」（一次唤醒后保持聆听，直到安静超时）。
         #: 只用于状态展示与排查：用户问"现在还要不要喊唤醒词"时看它。
         self.voice_session_active = False
+        #: 每台设备当前在跑的语音会话任务（device_id → Task）。
+        #:
+        #: **同时只允许一个会话**。不加这道守卫的后果实测过：控制台/接口连点
+        #: 几次"语音对话"就叠出多个会话 —— 它们互相抢麦克风、各自播报，又把
+        #: 对方的播报录成"用户说话"，于是机器人开始自己跟自己聊
+        #: （用户描述："机器人一直在乱说话"）。
+        self._voice_tasks: dict[str, asyncio.Task[Any]] = {}
 
         # --- 设备层 ---------------------------------------------------- #
         self.gateway = DeviceGateway(
@@ -429,14 +436,16 @@ class SparkBotRuntime:
         async def feed(chunk: bytes) -> None:
             """采集回调（在采集协程里被 await，所以可以安全地连 ASR）。"""
             nonlocal session, voice_chunks
+            # 先计数（**再**判断是否要连 ASR）：否则一旦连上会话就停止计数，
+            # 日志里每个"听到说话"的窗口都会显示成恰好等于门槛，没法用于标定。
+            if self._chunk_has_voice(chunk):
+                voice_chunks += 1
             if session is not None:
                 await session.push(chunk)
                 return
 
             buffered.append(chunk)
-            if self._chunk_has_voice(chunk):
-                voice_chunks += 1
-            else:
+            if not self._chunk_has_voice(chunk):
                 # 静音期间只留最近 1 秒，避免长静音把内存撑大
                 while sum(len(item) for item in buffered) > rate * 2:
                     buffered.pop(0)
@@ -580,14 +589,14 @@ class SparkBotRuntime:
         # 流式识别给了文本、但**没有实词**（"."、"。。" 这类）时，用整段识别
         # 复核一遍再决定。ASR 面对噪声常常吐出这种"非空但没内容"的结果，
         # 直接喂给模型它就会顺着往下编（实测机器人对着空气答"嗯，我在听着呢"）。
-        if streamed_text.strip() and not self._text_is_meaningful(streamed_text):
+        if streamed_text.strip() and not self._text_is_meaningful(streamed_text, peak=peak_now):
             logger.info("流式识别结果没有实词（%r），用整段识别复核", streamed_text[:16])
             with contextlib.suppress(SparkBotError):
                 confirm = await self.asr.transcribe(pcm, sample_rate=rate)
-                if self._text_is_meaningful(confirm.text):
+                if self._text_is_meaningful(confirm.text, peak=peak_now):
                     streamed_text = confirm.text
 
-        if streamed_text.strip() and not self._text_is_meaningful(streamed_text):
+        if streamed_text.strip() and not self._text_is_meaningful(streamed_text, peak=peak_now):
             # 复核后仍然没有实词：当成"没听清"，不回复、继续听。
             # 这里**不设置 error**：会话继续，不打断"保持唤醒"。
             result["stage"] = "garbled"
@@ -675,18 +684,24 @@ class SparkBotRuntime:
         return peak, rms
 
     @staticmethod
-    def _text_is_meaningful(text: str) -> bool:
-        """识别结果里有没有**实词**（至少一个汉字或字母数字）。
+    def _text_is_meaningful(text: str, *, peak: int = 0) -> bool:
+        """识别结果算不算"一句人话"。
 
         为什么不只看"非空"：ASR 面对噪声/静音经常回一个句点（"."）、
         省略号之类 —— 那是非空文本，喂给模型它就会顺着编一句
         （实测机器人对着空气答"嗯，我在听着呢，慢慢说～"）。
-        判据刻意放宽到"一个字符"：用户答"好""嗯"都算数。
+
+        两个判据：
+        * 实词（汉字/字母数字）**≥2 个** → 算人话；
+        * 只有 1 个实词（"好""I"）→ 只在**电平够大**时才算 ——
+          大概率是用户就在麦克风边上说的；电平很小（峰值 <2000）的多半是
+          环境噪声被 ASR 顺手"猜"出来的一个字（实测噪声窗口回出 'I.'，
+          机器人就接了一句"我只听到一个 I"）。
         """
-        for ch in text or "":
-            if ch.isalnum() or "\u4e00" <= ch <= "\u9fff":
-                return True
-        return False
+        letters = sum(1 for ch in (text or "") if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
+        if letters >= 2:
+            return True
+        return letters == 1 and peak >= 2000
 
     @staticmethod
     def _chunk_has_voice(pcm: bytes, *, threshold: int = 500) -> bool:
@@ -706,6 +721,11 @@ class SparkBotRuntime:
         if not samples:
             return False
         return max(abs(s) for s in samples) >= threshold
+
+    def voice_session_running(self, device_id: str | None = None) -> bool:
+        """该设备是否已有语音会话在跑（接口用它避免叠加触发）。"""
+        task = self._voice_tasks.get(device_id or "*")
+        return task is not None and not task.done()
 
     def _listen_window_ms(self) -> int:
         """设备侧一次 ``start_listen`` 的超时（毫秒）。
@@ -759,6 +779,18 @@ class SparkBotRuntime:
         idle_timeout = max(0.0, float(behavior.voice_session_idle_timeout_s))
         turn_cap = max(0, int(behavior.voice_session_turns))
         gap = max(0.0, float(behavior.voice_session_gap_s))
+
+        # **同一台设备同时只允许一个会话。**
+        # 叠加的后果实测过：多个会话互相抢麦克风、各自播报，又把对方的播报
+        # 录成"用户说话"，机器人开始自己跟自己聊（用户："一直在乱说话"）。
+        key = device_id or "*"
+        running = self._voice_tasks.get(key)
+        if running is not None and not running.done():
+            logger.warning("设备 %s 已有语音会话在跑，忽略这次唤醒/触发", device_id)
+            return
+        current = asyncio.current_task()
+        if current is not None:
+            self._voice_tasks[key] = current
 
         self.voice_session_active = True
         last_voice_at = time.monotonic()
@@ -840,6 +872,8 @@ class SparkBotRuntime:
                     await asyncio.sleep(gap)
         finally:
             self.voice_session_active = False
+            if current is not None and self._voice_tasks.get(key) is current:
+                self._voice_tasks.pop(key, None)
             if mic_open:
                 with contextlib.suppress(Exception):
                     await self._stop_device_audio(self.robots.get(device_id))

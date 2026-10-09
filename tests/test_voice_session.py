@@ -262,6 +262,35 @@ async def test_playback_waits(rt: SparkBotRuntime) -> None:
     check(bool(waits) and all(waits), "每一段播报都等设备播完再返回", str(waits))
 
 
+async def test_single_session(rt: SparkBotRuntime) -> None:
+    """阶段 7：同一台设备同时只能有一个会话。
+
+    真实事故：连续几次触发"语音对话"叠出了多个会话 —— 它们互相抢麦克风、
+    各自播报，又把对方的播报录成"用户说话"，机器人开始自己跟自己聊
+    （用户描述："机器人一直在乱说话"）。
+    """
+    logger.info("阶段 7 · 会话不叠加")
+    stub = StubVoiceTurn([{"stage": "silent", "text": "", "rms": 90}])
+    original = rt.voice_turn
+    rt.voice_turn = stub  # type: ignore[method-assign]
+    saved_timeout = rt.settings.behavior.voice_session_idle_timeout_s
+    rt.settings.behavior.voice_session_idle_timeout_s = 1.2
+    try:
+        first = asyncio.create_task(rt._handle_voice_turn("dev-x"))  # noqa: SLF001
+        await asyncio.sleep(0.15)
+        check(rt.voice_session_running("dev-x") is True, "会话进行中能被查询到")
+        rounds_before = len(stub.calls)
+        await asyncio.wait_for(rt._handle_voice_turn("dev-x"), timeout=2.0)  # noqa: SLF001
+        check(len(stub.calls) == rounds_before,
+              "第二次触发起被拒绝，没有多采一轮（否则两个会话会互录）",
+              f"{rounds_before} → {len(stub.calls)}")
+        await asyncio.wait_for(first, timeout=10.0)
+        check(rt.voice_session_running("dev-x") is False, "会话结束后标记被清掉")
+    finally:
+        rt.voice_turn = original  # type: ignore[method-assign]
+        rt.settings.behavior.voice_session_idle_timeout_s = saved_timeout
+
+
 async def test_turn_cap_still_works(rt: SparkBotRuntime) -> None:
     """阶段 4：voice_session_turns 仍能作为硬上限。"""
     logger.info("阶段 4 · 轮数上限")
@@ -306,6 +335,7 @@ async def main() -> int:
             await test_idle_timeout_window(rt, served)
             await test_lazy_asr(rt, device)
             await test_playback_waits(rt)
+            await test_single_session(rt)
             await test_turn_cap_still_works(rt)
         finally:
             await device.stop()

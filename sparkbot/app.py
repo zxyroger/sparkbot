@@ -728,6 +728,19 @@ def _register_routes(app: FastAPI) -> None:
 
         started = time.perf_counter()
 
+        # 已经有一个会话在跑就别再叠一个：两个会话会互相抢麦克风、各自播报，
+        # 还会把对方的播报录成"用户说话"，机器人就开始自己跟自己聊
+        # （实测：连点几次"语音对话"就变成"一直在乱说话"）。
+        if runtime.voice_session_running(robot.device_id):
+            return {
+                "ok": True,
+                "device_id": robot.device_id,
+                "already_running": True,
+                "heard": "",
+                "replied": "",
+                "note": "该设备已经在对话中，这次触发被忽略",
+            }
+
         if not bool(payload.get("wait", True)):
             asyncio.create_task(runtime._handle_voice_turn(robot.device_id))  # noqa: SLF001
             return {"ok": True, "device_id": robot.device_id, "wait": False}
