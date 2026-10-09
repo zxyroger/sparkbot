@@ -98,6 +98,13 @@ class MockDeviceConfig:
     audio_seconds: float = 1.8
     """每次采集模拟多长的语音。"""
 
+    silent_audio: bool = False
+    """置 true 时上传的是**近乎静音**的底噪，而不是合成语音。
+
+    用来验证"连续采集"里最关键的一条：静音轮不该去连 ASR、也不该回复，
+    但**上行要一直开着**（不能因为静音就把麦克风关了）。
+    """
+
     face_people: list[str] = field(default_factory=list)
     """模拟「站在摄像头前的人」；每个名字都会被识别成一张稳定的脸。"""
 
@@ -622,11 +629,24 @@ class MockDevice:
         如果正常结束和被取消各发一次，上一个会话的第二个 end 会残留在
         PC 侧队列里，让下一次采集刚开始就立刻「结束」并拿到空音频。
         """
+        import array
+        import random
+
         sample_rate = 16_000
-        pcm = speech_like_pcm(duration_s=self.config.audio_seconds, sample_rate=sample_rate)
         # 每片 20 ms，与真实固件常见的 I2S 分片大小一致。
         chunk_bytes = int(sample_rate * 0.02) * 2
-        chunks = [pcm[i : i + chunk_bytes] for i in range(0, len(pcm), chunk_bytes)]
+        speech_pcm = speech_like_pcm(
+            duration_s=self.config.audio_seconds, sample_rate=sample_rate
+        )
+        speech_chunks = [
+            speech_pcm[i : i + chunk_bytes] for i in range(0, len(speech_pcm), chunk_bytes)
+        ]
+        # "安静的房间里没人说话"：一点低幅底噪，**不是全 0** ——
+        # 全 0 在 PC 侧代表"麦克风坏了"，那是另一条分支。
+        _rng = random.Random(11)
+        silent_chunk = array.array(
+            "h", (_rng.randint(-45, 45) for _ in range(chunk_bytes // 2))
+        ).tobytes()
 
         await self._send(
             {
@@ -639,13 +659,31 @@ class MockDevice:
                 "channels": 1,
             }
         )
-        logger.info("🎤 开始上传模拟音频（%.1fs / %d 片）", self.config.audio_seconds, len(chunks))
+        logger.info(
+            "🎤 开始上传模拟音频（%.1fs / %d 片，%s）",
+            self.config.audio_seconds,
+            len(speech_chunks),
+            "静音底噪" if self.config.silent_audio else "合成语音",
+        )
 
         ended = False
+        # 像真机一样**持续推流**，直到被 stop_listen 打断或本会话超时。
+        # 早期实现只推固定的一小段就发 end，"连续采集"（麦克风一直开着）
+        # 根本测不出来：第一轮就把音频推完了，后面全是空的。
+        timeout_s = float(params.get("timeout_ms") or 8000) / 1000.0
+        deadline = time.monotonic() + min(max(timeout_s, 0.5), 60.0)
+        # 每片现取：`silent_audio` 允许在**推流过程中**切换，
+        # 这样"同一条连续音频流里先静音、后说话"也能被模拟出来
+        # （连续采集下麦克风是一直开着的，音频流不会因为场景变化重启）。
         try:
-            for index, chunk in enumerate(chunks):
+            index = 0
+            while time.monotonic() < deadline:
                 if self._stop.is_set():
                     return
+                if self.config.silent_audio:
+                    chunk = silent_chunk
+                else:
+                    chunk = speech_chunks[index % len(speech_chunks)]
                 await self._send(
                     {
                         "v": protocol.PROTOCOL_VERSION,
@@ -659,6 +697,7 @@ class MockDevice:
                         "data_b64": encode_b64(chunk),
                     }
                 )
+                index += 1
                 # 按真实时间推送，让 PC 侧的静音检测与超时逻辑得到真实验证。
                 await asyncio.sleep(0.02)
 

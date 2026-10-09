@@ -98,17 +98,22 @@ class StubVoiceTurn:
 
     真实的 voice_turn 要跑采集 + ASR + 对话 + 播报，一轮十几秒；
     这里只验证**会话状态机**，所以给它一个可控的假回合。
+
+    ``mic_open`` 按 stage 推导，与真实实现一致：
+    静音轮保持上行开着，说话轮关掉（要播报了）。
     """
 
     def __init__(self, script: list[dict]) -> None:
         self.script = script
         self.calls: list[dict] = []
 
-    async def __call__(self, device_id=None, *, beep: bool = True) -> dict:
+    async def __call__(self, device_id=None, *, beep: bool = True, listening: bool = False) -> dict:
         entry = self.script[min(len(self.calls), len(self.script) - 1)]
-        self.calls.append({"device_id": device_id, "beep": beep, **entry})
+        self.calls.append({"device_id": device_id, "beep": beep, "listening": listening, **entry})
         await asyncio.sleep(0.02)   # 模拟一轮的耗时
-        return dict(entry)
+        result = dict(entry)
+        result.setdefault("mic_open", entry.get("stage") == "silent")
+        return result
 
 
 async def test_keeps_listening(rt: SparkBotRuntime) -> None:
@@ -118,10 +123,10 @@ async def test_keeps_listening(rt: SparkBotRuntime) -> None:
     # 前 3 轮静音（0.8s 超时前足够跑完好几轮），第 4 轮有人说话，
     # 之后继续静音，直到超时退出。
     stub = StubVoiceTurn([
-        {"stage": "no_speech", "text": "", "rms": 90},   # 静音
-        {"stage": "no_speech", "text": "", "rms": 95},   # 静音
+        {"stage": "silent", "text": "", "rms": 90},      # 静音（保持上行）
+        {"stage": "silent", "text": "", "rms": 95},      # 静音
         {"stage": "done", "text": "你好", "rms": 800},   # 有语音 → 续期
-        {"stage": "no_speech", "text": "", "rms": 88},   # 静音
+        {"stage": "silent", "text": "", "rms": 88},      # 静音（重新开上行）
     ])
     original = rt.voice_turn
     rt.voice_turn = stub  # type: ignore[method-assign]
@@ -136,6 +141,14 @@ async def test_keeps_listening(rt: SparkBotRuntime) -> None:
     check(all(c["beep"] is False for c in stub.calls[1:]),
           "后续轮次不再「叮」—— 否则每几秒响一次会变成噪音",
           f"{[c['beep'] for c in stub.calls]}")
+    check(stub.calls[0]["listening"] is False, "第一轮先把音频上行打开")
+    silent_after_first = [c["listening"] for c in stub.calls[1:3]]
+    check(all(silent_after_first),
+          "静音轮之间**不关麦克风**（下一轮直接接着听）",
+          f"{[c['listening'] for c in stub.calls]}")
+    check(stub.calls[3]["listening"] is False,
+          "说话那轮结束后上行被关掉（播报前必须关，否则录到自己）",
+          f"{[c['listening'] for c in stub.calls]}")
     check(rt.voice_session_active is False, "会话结束后对话态关闭")
     heard_rounds = [i for i, c in enumerate(stub.calls) if c.get("text")]
     check(bool(heard_rounds), "有语音的那一轮被计为「听到」", str(heard_rounds))
@@ -163,7 +176,7 @@ async def test_idle_timeout_window(rt: SparkBotRuntime, served: ServedApp) -> No
     logger.info("阶段 3 · 静音计时")
     import httpx
 
-    stub = StubVoiceTurn([{"stage": "no_speech", "text": "", "rms": 90}])
+    stub = StubVoiceTurn([{"stage": "silent", "text": "", "rms": 90}])
     original = rt.voice_turn
     rt.voice_turn = stub  # type: ignore[method-assign]
     started = time.monotonic()
@@ -180,6 +193,47 @@ async def test_idle_timeout_window(rt: SparkBotRuntime, served: ServedApp) -> No
     check("voice_session" in status, "状态接口暴露 voice_session 字段",
           str(status.get("voice_session")))
     check(status.get("voice_session") is False, "空闲时不是对话态")
+
+
+async def test_lazy_asr(rt: SparkBotRuntime, device: MockDevice) -> None:
+    """阶段 6：静音不连 ASR，听到人声才连（走真实 voice_turn 路径）。
+
+    这条守的是"回调里出异常被吞掉"那类问题：曾经 feed() 里引用了没导入的
+    Robot，于是每片都抛 NameError，被采集循环吞成一行 warning ——
+    结果是**永远听不到人声、永远不连 ASR**，日志里只剩一堆分片回调失败。
+    """
+    logger.info("阶段 6 · 按需连 ASR")
+    robot = rt.robots.get()
+    opened: list[int] = []
+    real_open = rt.asr.open_stream  # type: ignore[union-attr]
+
+    async def spy_open(**kwargs):
+        opened.append(1)
+        return await real_open(**kwargs)
+
+    rt.asr.open_stream = spy_open  # type: ignore[union-attr,method-assign]
+    try:
+        # ① 静音：不连 ASR，但上行保持开着
+        device.config.silent_audio = True
+        quiet = await rt.voice_turn(robot.device_id, beep=False)
+        check(quiet.get("stage") == "silent", "静音轮判为静音", str(quiet.get("stage")))
+        check(quiet.get("mic_open") is True, "静音轮**保持上行开着**（不关麦克风）")
+        check(not opened, "静音轮没有连接流式 ASR", f"{len(opened)} 次")
+        check(int(quiet.get("rms") or 0) < 250, "静音轮电平确实很低",
+              f"RMS={quiet.get('rms')}")
+
+        # ② 有人说话：连 ASR、出文本、关上行走播报
+        device.config.silent_audio = False
+        spoke = await rt.voice_turn(robot.device_id, beep=False, listening=True)
+        check(bool(opened), "听到人声才连接流式 ASR", f"{len(opened)} 次")
+        check(bool(str(spoke.get("text") or "").strip()), "识别出了文本",
+              str(spoke.get("text"))[:30])
+        check(spoke.get("mic_open") is False, "说话轮结束后关掉上行（准备播报）")
+    finally:
+        rt.asr.open_stream = real_open  # type: ignore[union-attr,method-assign]
+        device.config.silent_audio = False
+        with contextlib.suppress(Exception):
+            await rt._stop_device_audio(robot)  # noqa: SLF001
 
 
 async def test_playback_waits(rt: SparkBotRuntime) -> None:
@@ -250,6 +304,7 @@ async def main() -> int:
             await test_keeps_listening(rt)
             await test_rms_counts_as_speech(rt)
             await test_idle_timeout_window(rt, served)
+            await test_lazy_asr(rt, device)
             await test_playback_waits(rt)
             await test_turn_cap_still_works(rt)
         finally:

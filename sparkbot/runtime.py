@@ -315,7 +315,11 @@ class SparkBotRuntime:
 
 
     async def voice_turn(
-        self, device_id: str | None = None, *, beep: bool = True
+        self,
+        device_id: str | None = None,
+        *,
+        beep: bool = True,
+        listening: bool = False,
     ) -> dict[str, Any]:
         """完成一次完整的语音交互，并返回各阶段结果。
 
@@ -323,12 +327,17 @@ class SparkBotRuntime:
             device_id: 目标设备；``None`` 表示当前唯一在线设备。
             beep: 开始采集前是否"叮"一声提示可以说话了。会话态里只有第一轮
                 需要 —— 每轮都响会变成噪音（见 ``_handle_voice_turn``）。
+            listening: 设备的**音频上行是否已经开着**。连续对话时会话只在
+                开始时开一次上行，之后每轮都传 ``True`` —— 这样麦克风不会
+                被周期性开关（开关一次就是一次"听不见"的盲区）。
 
         成功时返回的字典包含：
 
         * ``stage``   —— 走到哪一步（``done`` / ``no_speech`` / ``empty_text``）
         * ``text``    —— 识别出的文本
         * ``reply``   —— agent 的回复
+        * ``mic_open``—— 返回时上行是否还开着（静音轮保持开着，
+                        要播报前会被关掉）
         * ``recorded_s`` / ``pcm_bytes`` —— 采集到的音频规模
         * ``turn``    —— 完整的 ``AgentTurn`` 信息（工具调用、用量、耗时）
         * ``error``   —— 失败原因（有值时后面几个字段为空）
@@ -337,7 +346,14 @@ class SparkBotRuntime:
         单独坏掉（麦克风、ASR、模型、喇叭），调用方需要知道是**哪一环**坏了，
         而不是只收到一个笼统的失败。
         """
-        result: dict[str, Any] = {"stage": "start", "text": "", "reply": ""}
+        result: dict[str, Any] = {
+            "stage": "start",
+            "text": "",
+            "reply": "",
+            # 出错时也要如实告诉调用方上行是开是关，否则会话结束时
+            # 会漏掉一次 stop_listen，设备那边一直往下推音频。
+            "mic_open": bool(listening),
+        }
 
         if self.asr is None:
             result["error"] = "语音识别未启用（SPARKBOT_SPEECH_ASR_PROVIDER=disabled）"
@@ -360,15 +376,56 @@ class SparkBotRuntime:
         if beep and robot.has("speaker"):
             with contextlib.suppress(SparkBotError):
                 await robot.play_tone(frequency_hz=880.0, duration_ms=90)
+            # 让"叮"的尾音先散掉再开采集。
+            # 不等的后果实测过：连续采集下第一轮的电平被自己的提示音顶到
+            # RMS≈900 / 峰值≈10000，直接被判成"有人在说话"，机器人回一句
+            # 莫名其妙的话。（这些数看采集结果那行日志就能对上。）
+            # 0.5 秒是量出来的：留 0.3 秒时第一轮 RMS 还有 241，紧贴 250 的门槛，
+            # 再遇到回声大一点的房间就会误判。
+            await asyncio.sleep(0.5)
 
         rate = self.settings.speech.input_sample_rate
 
-        # ---- 流式识别会话（能用就用，用不了自动回退整段识别） -------------- #
-        # 为什么要在这里就开：采集是"边收边推"的，识别必须**同时**进行，
-        # 等采集完再连就晚了一步。partial 文本会实时发到事件总线，
-        # 控制台因此能边听边出字。
+        # ---- 音频上行：连续对话时**只在会话开始时开一次** ------------------ #
+        # 设备侧麦克风本来就是常开的（唤醒词要一直听），start_listen 只是
+        # 打开"音频上行"。周期性开关上行有两个坏处：每次开关都是一段
+        # "听不见"的盲区（用户刚好在这时开口，前半句就没了），而且设备
+        # 每轮都要发 start/end 标记。所以这里默认把它开着，直到要播报时才关。
+        if not listening:
+            try:
+                await robot.start_listen(timeout_ms=self._listen_window_ms())
+                # 丢掉打开瞬间可能残留的旧分片（上一次会话的尾巴）
+                await self._drain_device_audio(robot)
+            except SparkBotError as exc:
+                result["error"] = f"打开麦克风失败: {exc.message}"
+                logger.warning(result["error"])
+                return result
+            result["mic_open"] = True
+
+        # ---- 流式识别会话：**听到人声才连** -------------------------------- #
+        # 连续采集模式下静音轮很多（每 1.5 秒一轮），如果每轮都连一次 ASR，
+        # 服务端会被一堆空会话淹没。所以先只在本地缓存分片，第一次出现人声
+        # 能量时才连 ASR，并把本轮**从头攒下的分片**补进去 —— 一个词都不丢；
+        # 静音轮则完全不连 ASR、不进模型、不花钱。
         session = None
-        if self.asr is not None and getattr(self.asr, "supports_streaming", False):
+        buffered: list[bytes] = []
+
+        async def feed(chunk: bytes) -> None:
+            """采集回调（在采集协程里被 await，所以可以安全地连 ASR）。"""
+            nonlocal session
+            if session is not None:
+                await session.push(chunk)
+                return
+
+            buffered.append(chunk)
+            if not self._chunk_has_voice(chunk):
+                # 静音期间只留最近 1 秒，避免长静音把内存撑大
+                while sum(len(item) for item in buffered) > rate * 2:
+                    buffered.pop(0)
+                return
+
+            if self.asr is None or not getattr(self.asr, "supports_streaming", False):
+                return  # 没有流式识别：留给后面的整段识别兜底
             try:
                 session = await self.asr.open_stream(
                     sample_rate=rate,
@@ -379,16 +436,24 @@ class SparkBotRuntime:
             except Exception as exc:  # noqa: BLE001 - 服务端没流式端点时回退
                 logger.warning("流式识别不可用，回退到整段识别: %s", exc)
                 session = None
+                return
+            for item in buffered:
+                await session.push(item)
+            buffered.clear()
 
         try:
             pcm = await robot.collect_audio(
                 max_seconds=max(3.0, self.settings.speech.listen_timeout_s + 4.0),
                 silence_timeout_s=self.settings.speech.listen_timeout_s,
-                on_chunk=session.push if session is not None else None,
+                # 上行已经开着，这里不再重复 start_listen / stop_listen ——
+                # 开关时机由会话层统一决定（见 _handle_voice_turn）。
+                start=False,
+                on_chunk=feed,
             )
         except SparkBotError as exc:
             if session is not None:
                 await session.aclose()
+            await self._stop_device_audio(robot)
             result["error"] = f"采集音频失败: {exc.message}"
             logger.warning(result["error"])
             return result
@@ -424,6 +489,7 @@ class SparkBotRuntime:
         )
 
         if not pcm:
+            await self._stop_device_audio(robot)
             result["stage"] = "no_speech"
             result["error"] = (
                 "没有采集到音频。排查顺序："
@@ -434,13 +500,16 @@ class SparkBotRuntime:
             logger.warning(result["error"])
             return result
 
-        # 能量检查：全零或极弱说明麦克风没真正工作，与"用户没说话"是两回事。
-        peak = peak_now
-        result["peak"] = peak
+        result["peak"] = peak_now
         result["rms"] = rms_now
-        if peak < 200:
+
+        # 全零 = 麦克风真的没在工作，与"用户没说话"是两回事。
+        # 注意门槛从"峰值 <200"改成"== 0"：连续采集下每轮只有 ~1.5 秒，
+        # 安静时峰值本来就接近 200，再拿 200 当门槛会把正常静音误判成故障。
+        if peak_now == 0:
+            await self._stop_device_audio(robot)
             result["stage"] = "silent"
-            result["error"] = f"采集到的音频几乎全静音（峰值 {peak}）—— 麦克风可能没在工作"
+            result["error"] = "采集到的音频全是 0 —— 麦克风可能没在工作"
             logger.warning(result["error"])
             return result
 
@@ -451,13 +520,22 @@ class SparkBotRuntime:
         # 自言自语（实测每 5 秒插一句"我就守在这儿，没动～"）。
         # 按电平挡掉最直接，也顺带省掉一次识别 + 一次模型调用。
         min_rms = max(0, int(self.settings.behavior.speech_min_rms))
-        if min_rms and rms_now < min_rms:
+        if session is None or (min_rms and rms_now < min_rms):
             result["stage"] = "silent"
             result["hint"] = f"低于语音门槛（RMS {rms_now} < {min_rms}），按静音处理"
+            # **保持上行**：连续采集的关键 —— 静音期间不关麦克风，
+            # 下一轮立刻接着听，用户不会遇到"刚好开口时前半句被吃掉"。
+            result["mic_open"] = True
             logger.info(
-                "本轮按静音处理（RMS=%d 峰值=%d，未进 ASR）", rms_now, peak
+                "本轮按静音处理（RMS=%d 峰值=%d，未进 ASR）", rms_now, peak_now
             )
             return result
+
+        # 有人说话：**先关上行再识别/回复/播报**。
+        # 播报时必须关：设备就贴着喇叭，不关就会把自己的声音录进来
+        # （实测第二轮识别出"次好吗？"，正是上一句的尾巴）。
+        await self._stop_device_audio(robot)
+        result["mic_open"] = False
 
         try:
             if streamed_text.strip():
@@ -538,6 +616,54 @@ class SparkBotRuntime:
         rms = int(math.sqrt(sum(s * s for s in samples) / len(samples)))
         return peak, rms
 
+    @staticmethod
+    def _chunk_has_voice(pcm: bytes, *, threshold: int = 500) -> bool:
+        """单个分片里有没有语音能量（峰值门槛 500）。
+
+        与 ``Robot._has_voice_energy`` 同一判据，但放在 Runtime 里：
+        采集回调是 runtime 的对象，不该去引用另一个类的私有方法
+        （踩过 —— 回调里抛 NameError 会被采集循环吞成一行 warning，
+        结果"永远听不到人声"，排查起来极绕）。
+        """
+        import array
+
+        if len(pcm) < 4:
+            return False
+        samples = array.array("h")
+        samples.frombytes(pcm[: len(pcm) - (len(pcm) % 2)])
+        if not samples:
+            return False
+        return max(abs(s) for s in samples) >= threshold
+
+    def _listen_window_ms(self) -> int:
+        """设备侧一次 ``start_listen`` 的超时（毫秒）。
+
+        连续对话时上行**一次开到底**，所以这个窗口要盖住整段会话。
+        设备到点会自己结束并发 ``listen_timeout``，我们也会显式 stop，
+        所以给足余量即可；上限 30 分钟，防止配置写错把设备锁死。
+        """
+        idle = max(0.0, float(self.settings.behavior.voice_session_idle_timeout_s))
+        window_s = max(60.0, idle + 60.0)
+        return int(min(window_s, 1800.0) * 1000)
+
+    async def _drain_device_audio(self, robot: Robot) -> None:
+        """丢掉设备已经推上来、但上一轮没用到的陈旧分片。
+
+        刚打开上行时队列里可能还躺着上一次会话的尾巴，不清掉就会被当成
+        "用户说的第一句话"。
+        """
+        with contextlib.suppress(Exception):
+            await robot._drain_audio()  # noqa: SLF001 - 同包内部方法
+
+    async def _stop_device_audio(self, robot: Robot) -> None:
+        """关掉音频上行（播报前 / 会话结束时）。
+
+        忘记关的后果很具体：设备会一直把录音推上来而 PC 不再消费，
+        白占 WiFi，而且下次打开上行时队列里全是陈旧音频。
+        """
+        with contextlib.suppress(SparkBotError, DeviceOfflineError):
+            await robot.stop_listen()
+
     async def _handle_voice_turn(self, device_id: str | None) -> None:
         """一次唤醒后的**语音会话**：保持"对话态"，直到安静足够久。
 
@@ -566,6 +692,9 @@ class SparkBotRuntime:
         last_voice_at = time.monotonic()
         rounds = 0
         consecutive_errors = 0
+        #: 设备音频上行是否开着。连续采集的核心：**静音期间保持开着**，
+        #: 只有要播报时才关，播完再开。开关一次就是一次"听不见"的盲区。
+        mic_open = False
         logger.info(
             "语音会话开始（静音 %.1f 秒后退出，轮数上限 %s）",
             idle_timeout,
@@ -574,8 +703,21 @@ class SparkBotRuntime:
         try:
             while True:
                 # 只有第一轮"叮"一声：会话态里每轮都响会变成噪音。
-                result = await self.voice_turn(device_id, beep=(rounds == 0))
+                try:
+                    result = await self.voice_turn(
+                        device_id, beep=(rounds == 0), listening=mic_open
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    # 一轮里的**意外**（代码 bug、协议解析失败）不该让整段会话
+                    # 死在无人区：/api/voice/trigger 是 fire-and-forget 任务，
+                    # 异常只会变成一条 "Task exception was never retrieved"。
+                    # 这里记全栈并收工，日志里能直接看到是哪一行。
+                    logger.exception("语音会话第 %d 轮异常，结束本次会话: %s", rounds + 1, exc)
+                    break
                 rounds += 1
+                mic_open = bool(result.get("mic_open"))
 
                 if result.get("error"):
                     # 偶发失败（一次上行丢包、设备正忙）不该直接掐掉整段会话，
@@ -587,6 +729,7 @@ class SparkBotRuntime:
                     )
                     if consecutive_errors >= 3:
                         break
+                    mic_open = False
                     await asyncio.sleep(gap)
                     continue
                 consecutive_errors = 0
@@ -612,16 +755,17 @@ class SparkBotRuntime:
                     )
                     break
 
-                # 轮间等待：让扬声器把话说完，并给用户反应时间。
-                # 不留这段时间的话，麦克风会把机器人自己的声音收进去，
-                # 变成"自己跟自己说话"。
-                #
-                # 但**没听到人声的那一轮不用等**：那一轮根本没有播报，
-                # 不存在回声风险；等满 1.2 秒只会制造一段"听不见你说话"的
-                # 盲区 —— 用户恰好在这段开口时，前半句就被切掉了。
-                await asyncio.sleep(gap if heard else gap * 0.15)
+                # 只有**播报过**的那一轮才需要等：那一轮麦克风刚被关掉，
+                # 要留出时间让扬声器把话说完，否则会把自己的声音收进来。
+                # 静音轮既没有播报、上行也一直开着，立刻接着听就行 ——
+                # 这一等一开就是用户"刚开口前半句被吃掉"的根源。
+                if heard:
+                    await asyncio.sleep(gap)
         finally:
             self.voice_session_active = False
+            if mic_open:
+                with contextlib.suppress(Exception):
+                    await self._stop_device_audio(self.robots.get(device_id))
             await self._close_voice_session(device_id)
 
     def _heard_speech(self, result: dict[str, Any]) -> bool:
