@@ -33,6 +33,7 @@ import json
 import logging
 import time
 import wave
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -94,6 +95,23 @@ _stream_ready = False
 _stream_error: str | None = None
 _stream_load_seconds = 0.0
 _stream_lock = asyncio.Lock()
+
+# --------------------------------------------------------------------------- #
+# 说话人声纹（speaker embedding）
+# --------------------------------------------------------------------------- #
+#:
+#: 用 CAM++ 中文说话人模型（3D-Speaker，16kHz）：把一段语音压成 192 维向量，
+#: 同一个人的两段话向量接近、不同人相差大。PC 侧据此判断"现在是谁在说话"，
+#: 从而把长期记忆里的名字对到人头上。
+#:
+#: 模型是**离线**的、单次推理约 10~30ms（2 秒音频），可以每条语音都算。
+_SPEAKER_MODEL = (
+    Path(__file__).resolve().parent
+    / "models" / "speaker" / "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
+)
+_speaker_extractor: Any = None
+_speaker_error: str | None = None
+_speaker_load_seconds = 0.0
 
 #: 最终文本用哪个模型出：
 #:   * ``batch`` —— 说完后用 SenseVoice 对整段重识别一次（默认）。
@@ -182,6 +200,14 @@ async def health() -> dict[str, Any]:
             "load_seconds": round(_stream_load_seconds, 1),
             "chunk_ms": 600,
         },
+        # 声纹（说话人识别）
+        "speaker": {
+            "ready": _speaker_extractor is not None,
+            "dim": _speaker_extractor.dim if _speaker_extractor is not None else None,
+            "model": _SPEAKER_MODEL.name,
+            "error": _speaker_error,
+            "load_seconds": round(_speaker_load_seconds, 1),
+        },
     }
 
 
@@ -265,6 +291,64 @@ async def transcriptions(
 # --------------------------------------------------------------------------- #
 # 流式识别
 # --------------------------------------------------------------------------- #
+@app.post("/v1/speaker/embed")
+async def speaker_embed(
+    file: UploadFile = File(...),  # noqa: B008 - FastAPI 依赖注入写法
+) -> JSONResponse:
+    """说话人声纹：上传一段 WAV，返回 192 维 embedding（已归一化）。
+
+    用法上跟 ``/v1/audio/transcriptions`` 完全对称 —— 采集到一段语音就
+    顺手算一次声纹，PC 侧拿它去和已登记的人比对（余弦相似度）。
+
+    返回的向量**已做 L2 归一化**，所以比较时直接点积就是余弦相似度。
+    """
+    if _speaker_extractor is None:
+        raise HTTPException(status_code=503, detail=_speaker_error or "声纹模型未就绪")
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="空的音频文件")
+    try:
+        pcm = load_wav_to_float32(raw)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"音频解析失败: {exc}") from exc
+
+    # 太短的音频算不出稳定声纹（CAM++ 至少需要几百毫秒）
+    if pcm.size < 16000 * 0.4:
+        raise HTTPException(status_code=400, detail="音频太短，至少需要 0.4 秒")
+
+    t0 = time.perf_counter()
+    try:
+        emb = await asyncio.to_thread(_speaker_embedding, pcm, 16000)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("声纹提取失败")
+        raise HTTPException(status_code=500, detail=f"声纹提取失败: {exc}") from exc
+    infer_ms = (time.perf_counter() - t0) * 1000
+
+    logger.info(
+        "声纹: 音频 %.2fs -> %d 维 (%.0fms)",
+        pcm.size / 16000.0, len(emb), infer_ms,
+    )
+    return JSONResponse(content={
+        "embedding": emb,
+        "dim": len(emb),
+        "audio_seconds": round(pcm.size / 16000.0, 3),
+        "infer_ms": round(infer_ms, 1),
+    })
+
+
+def _speaker_embedding(pcm: np.ndarray, sample_rate: int) -> list[float]:
+    """同步算一段语音的声纹向量（L2 归一化后返回）。"""
+    stream = _speaker_extractor.create_stream()
+    stream.accept_waveform(sample_rate=sample_rate, waveform=pcm)
+    stream.input_finished()
+    vec = np.asarray(_speaker_extractor.compute(stream), dtype=np.float32).reshape(-1)
+    norm = float(np.linalg.norm(vec))
+    if norm > 1e-9:
+        vec = vec / norm
+    return [round(float(x), 6) for x in vec]
+
+
 def _stream_decode(chunk: np.ndarray, cache: dict[str, Any], is_final: bool) -> str:
     """同步解一块流式音频，返回**到目前为止**的整段文本。
 
@@ -432,6 +516,7 @@ def main() -> int:
     global _model, _model_name, _load_seconds
     global _stream_model, _stream_ready, _stream_error, _stream_load_seconds
     global STREAM_FINAL_MODE
+    global _speaker_extractor, _speaker_error, _speaker_load_seconds
 
     p = argparse.ArgumentParser(description="本地 SenseVoice ASR 服务（OpenAI 兼容）")
     p.add_argument("--host", default="127.0.0.1")
@@ -444,6 +529,8 @@ def main() -> int:
                    help="流式识别用的 FunASR 模型 id")
     p.add_argument("--no-stream", action="store_true",
                    help="不加载流式模型（只保留批处理接口）")
+    p.add_argument("--no-speaker", action="store_true",
+                   help="不加载说话人声纹模型")
     p.add_argument("--stream-final", choices=("batch", "stream"), default=STREAM_FINAL_MODE,
                    help="最终文本来源：batch=用 SenseVoice 复核（准，句末 +0.4s）；"
                         "stream=直接用流式结果（快，精度略低）")
@@ -512,6 +599,35 @@ def main() -> int:
         _stream_load_seconds = time.perf_counter() - st0
         if _stream_ready:
             logger.info("流式模型就绪，耗时 %.1f 秒（600ms 一块）", _stream_load_seconds)
+
+    # ---- 说话人声纹（CAM++） ------------------------------------------- #
+    if args.no_speaker:
+        _speaker_error = "已通过 --no-speaker 关闭"
+        logger.info("声纹识别已关闭（--no-speaker）")
+    elif not _SPEAKER_MODEL.exists():
+        _speaker_error = f"模型文件不存在: {_SPEAKER_MODEL}"
+        logger.warning("声纹模型缺失，说话人识别不可用: %s", _SPEAKER_MODEL)
+    else:
+        sp0 = time.perf_counter()
+        logger.info("正在加载声纹模型 %s …", _SPEAKER_MODEL.name)
+        try:
+            import sherpa_onnx
+
+            cfg = sherpa_onnx.SpeakerEmbeddingExtractorConfig(
+                model=str(_SPEAKER_MODEL), num_threads=2, provider="cpu"
+            )
+            if not cfg.validate():
+                raise RuntimeError("配置校验失败")
+            _speaker_extractor = sherpa_onnx.SpeakerEmbeddingExtractor(cfg)
+        except Exception as exc:  # noqa: BLE001 - 声纹坏了不影响识别/合成
+            _speaker_error = f"{type(exc).__name__}: {exc}"
+            logger.warning("声纹模型加载失败: %s", _speaker_error, exc_info=True)
+        _speaker_load_seconds = time.perf_counter() - sp0
+        if _speaker_extractor is not None:
+            logger.info(
+                "声纹模型就绪，耗时 %.1f 秒（%d 维）",
+                _speaker_load_seconds, _speaker_extractor.dim,
+            )
 
     logger.info("服务启动: http://%s:%d/v1  (health: /health)", args.host, args.port)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
