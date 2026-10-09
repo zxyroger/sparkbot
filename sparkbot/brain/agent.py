@@ -317,6 +317,35 @@ def infer_emotion(text: str) -> Emotion | None:
     return None
 
 
+#: 模型偶尔会把内部标记当正文吐出来（实测：
+#: ``不客气～ <issue_start>show_emotion: love<issue_end>\n<paren_end>``）。
+#: 这些标记会被 TTS **一字不差地念出来**，用户听到的就是一串乱码。
+_ARTIFACT_BLOCK_RE = re.compile(r"<issue_start>.*?<issue_end>", re.S)
+_ARTIFACT_TAG_RE = re.compile(r"</?[A-Za-z_][A-Za-z0-9_]*(?:\s*[:=][^<>]*)?>")
+_SPACE_RUN_RE = re.compile(r"[ \t]{2,}")
+
+
+def strip_model_artifacts(text: str) -> str:
+    """清掉回复里漏出来的内部标记，返回能直接播报的文本。
+
+    三种情况都要处理：
+    * 成对的 ``<issue_start>…<issue_end>`` —— 整段扔掉（里面是它想表达的
+      工具调用，不该念出来）；
+    * 只有开头的 ``<issue_start>``（被 max_tokens 截断）—— 从它开始全截掉；
+    * 零散的 ``<paren_end>`` 之类 —— 按标签删掉。
+
+    只在出现"像标签"的片段时才动它，正常回复不受影响。
+    """
+    original = text or ""
+    cleaned = _ARTIFACT_BLOCK_RE.sub(" ", original)
+    cleaned = cleaned.split("<issue_start>")[0]
+    cleaned = _ARTIFACT_TAG_RE.sub(" ", cleaned)
+    cleaned = _SPACE_RUN_RE.sub(" ", cleaned).strip()
+    if cleaned != original.strip():
+        logger.info("回复里混进了模型内部标记，已清理: %r → %r", original[:60], cleaned[:60])
+    return cleaned
+
+
 #: 播报分段用的句末标点（中英文都算）。
 _SENTENCE_RE = re.compile(r"[^。！？!?；;\n]*[。！？!?；;\n]+|[^。！？!?；;\n]+")
 
@@ -444,6 +473,11 @@ class Agent:
                 logger.exception("人脸库初始化失败，将以无人脸识别模式运行")
         if self.ctx is not None:
             self.ctx.face_db = self.face_db
+        # 人脸扫描缓存（见 face.scan_ttl_s）：避免每轮都花 1~2 秒重扫同一张脸。
+        self._face_scan: FaceScan | None = None
+        self._face_scan_hint: str = ""
+        self._face_scan_matches: list[FaceMatch] = []
+        self._face_scan_at: float = 0.0
         self._lock = asyncio.Lock()
         """串行化同一台机器人的对话，避免两轮对话抢同一个底盘。"""
 
@@ -477,6 +511,9 @@ class Agent:
             "7. 一旦知道面前的人是谁 —— 姓名，或者「小明的爸爸」「我是妈妈」"
             "这类称呼 —— 就调用 bind_face 把眼前这张脸和这个称呼绑起来，"
             "以后才认得出他。称呼用用户自己说的说法，不要改写成别的词。\n"
+            "8. 用户说的话**已经由系统自动转成文字给你了**。不要为了"
+            "「听清一点」「确认能不能听见」「再听一遍」去调用 listen —— "
+            "那会让用户白白多等五六秒。只有用户明确说「你来听我说」时才用它。\n"
         )
 
     def _device_context(self) -> str:
@@ -625,6 +662,16 @@ class Agent:
         if not self.settings.face.auto_scan:
             return None, ""
 
+        # 缓存：同一个人在一轮对话里脸不会变，而设备端一次扫描要 1.4~2.3 秒。
+        # 每轮重扫等于每轮白等两秒（用户感受："说完话反应有点迟钝"）。
+        ttl = max(0.0, float(getattr(self.settings.face, "scan_ttl_s", 0.0)))
+        if ttl and self._face_scan_at and time.monotonic() - self._face_scan_at < ttl:
+            self._face_hint = self._face_scan_hint
+            self._face_matches = self._face_scan_matches
+            logger.debug("人脸扫描命中缓存（%.0fs 内），本轮不再扫",
+                         time.monotonic() - self._face_scan_at)
+            return self._face_scan, self._face_scan_hint
+
         try:
             robot = self.robots.get(self.device_id)
         except DeviceOfflineError:
@@ -645,10 +692,10 @@ class Agent:
             if scan.too_dark:
                 # 别把"太黑"说成"没人"—— 前者要人去开灯/调角度，
                 # 后者是正常结果，混在一起用户会以为是识别坏了。
-                return scan, (
+                return self._cache_face_scan(scan, (
                     f"摄像头画面很暗（平均亮度 {scan.mean_luma}/255），看不清前面有没有人。"
                     "可以提醒对方把灯打开或让光线照到镜头这一侧。"
-                )
+                ))
             if scan.dropped:
                 # 设备说检到了脸、特征却用不了（字段缺失/解不开）。
                 # 这不是"没人"，而是链路坏了，必须说出来而不是显示成 0。
@@ -657,11 +704,11 @@ class Agent:
                     scan.reported_count,
                     scan.dropped,
                 )
-                return scan, (
+                return self._cache_face_scan(scan, (
                     f"设备其实检测到 {scan.reported_count} 张脸，但人脸特征数据不完整，"
                     "没法认人。这通常是固件与 PC 端版本不匹配，需要更新固件。"
-                )
-            return scan, "摄像头里没有检测到人脸。"
+                ))
+            return self._cache_face_scan(scan, "摄像头里没有检测到人脸。")
 
         try:
             matches = self.face_db.match_scan(scan.faces)
@@ -684,7 +731,27 @@ class Agent:
             device_id=self.device_id,
             faces=[m.to_dict() for m in matches],
         )
+        return self._cache_face_scan(scan, hint)
+
+    def _cache_face_scan(self, scan: FaceScan | None, hint: str) -> tuple[FaceScan | None, str]:
+        """记住这次扫描结果，供 ``face.scan_ttl_s`` 秒内的后续轮次复用。
+
+        只作用于"每轮注入上下文"这条路；显式的 ``scan_faces`` / ``bind_face``
+        仍然每次都真扫 —— 绑脸要的就是此刻这张脸。
+        """
+        self._face_scan = scan
+        self._face_scan_hint = hint
+        self._face_scan_matches = list(self._face_matches)
+        self._face_scan_at = time.monotonic()
         return scan, hint
+
+    def invalidate_face_cache(self) -> None:
+        """让下一次 ``_look_at_faces`` 必须重新扫。
+
+        会话开始时调用：新的一次唤醒很可能是**另一个人**走过来了，
+        沿用上一次的缓存会把新说话的人认成上一个（比"慢两秒"糟得多）。
+        """
+        self._face_scan_at = 0.0
 
     def _render_face_hint(self, matches: list[FaceMatch]) -> str:
         """把匹配结果写成一句模型能直接用的中文。"""
@@ -916,6 +983,9 @@ class Agent:
                 logger.exception("agent 循环异常")
 
             turn.duration_ms = int((time.perf_counter() - started) * 1000)
+            # 清掉模型漏出来的内部标记（<issue_start>…<issue_end> 之类）——
+            # 否则会被 TTS 一字不差地念给用户听。
+            turn.reply = strip_model_artifacts(turn.reply)
             self.memory.append(ChatMessage(role="assistant", content=turn.reply))
 
             # 从用户这句话里抽取值得长期记住的事实。
@@ -1084,10 +1154,11 @@ class Agent:
             if not explicit:
                 emotion = infer_emotion(turn.reply)
                 if emotion is not None and robot.has(CAP_DISPLAY):
-                    try:
-                        await robot.set_face(emotion, intensity=0.8)
-                    except SparkBotError as exc:
-                        logger.debug("自动表情失败: %s", exc)
+                    # **不 await**：换表情是一次设备往返（几十到几百毫秒），
+                    # 串行等它会把这段时间直接加到"用户说完到听见回复"里。
+                    # 表情和语音本来就是两件事，让它们并行 —— 命令按发送顺序
+                    # 到达设备，观感仍然是"先换表情、再说话"。
+                    asyncio.ensure_future(self._set_face_quietly(robot, emotion))
 
         if not announce:
             return
@@ -1136,6 +1207,14 @@ class Agent:
             logger.warning("播报失败: %s", exc.message)
         except Exception as exc:  # noqa: BLE001 - 这里出错不该让对话失败
             logger.exception("播报异常: %s", exc)
+
+    @staticmethod
+    async def _set_face_quietly(robot: Robot, emotion: Emotion) -> None:
+        """后台换表情：失败只记日志（表情是锦上添花，不该影响播报）。"""
+        try:
+            await robot.set_face(emotion, intensity=0.8)
+        except SparkBotError as exc:
+            logger.debug("自动表情失败: %s", exc)
 
     async def _speak_segment(self, robot: Robot, text: str, *, wait: bool = False) -> None:
         """合成一段并下发；``wait=True`` 时等到设备真的播完再返回。

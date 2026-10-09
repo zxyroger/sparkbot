@@ -196,6 +196,14 @@ class FaceSettings(BaseSettings):
     auto_enroll: bool = True
     #: 每轮最多把几个人的身份注入 system prompt。
     max_injected: int = 2
+    #: 人脸扫描结果的缓存时长（秒）。
+    #:
+    #: 为什么要缓存：设备端一次"检测 + 提特征"要 1.4~2.3 秒（还在摄像头锁里），
+    #: 而**同一个人在一轮对话里脸不会变**。每轮都重扫等于每轮白等两秒 ——
+    #: 用户感受就是"说完话反应有点迟钝"。对话中两轮间隔通常十几秒，
+    #: 所以 30 秒的缓存能覆盖连续几轮，第一轮之后就不再花这个时间。
+    #: 0 = 不缓存（每轮都重扫）。
+    scan_ttl_s: float = 30.0
 
 
 class BehaviorSettings(BaseSettings):
@@ -364,6 +372,7 @@ EDITABLE_FIELDS: dict[str, str] = {
     "face.auto_enroll": "SPARKBOT_FACE_AUTO_ENROLL",
     "face.max_injected": "SPARKBOT_FACE_MAX_INJECTED",
     "face.max_samples": "SPARKBOT_FACE_MAX_SAMPLES",
+    "face.scan_ttl_s": "SPARKBOT_FACE_SCAN_TTL_S",
     "persona": "SPARKBOT_PERSONA",
 }
 

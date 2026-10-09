@@ -764,6 +764,11 @@ class SparkBotRuntime:
         last_voice_at = time.monotonic()
         rounds = 0
         consecutive_errors = 0
+        # 新的一次唤醒很可能是另一个人走过来 —— 人脸必须重扫，
+        # 不能沿用上一轮会话的缓存（见 Agent.invalidate_face_cache）。
+        agent = self.agents.all().get(device_id or "")
+        if agent is not None:
+            agent.invalidate_face_cache()
         #: 设备音频上行是否开着。连续采集的核心：**静音期间保持开着**，
         #: 只有要播报时才关，播完再开。开关一次就是一次"听不见"的盲区。
         mic_open = False

@@ -523,10 +523,12 @@ def build_registry(ctx: ToolContext) -> ToolRegistry:
 
     @registry.register(requires={CAP_MICROPHONE})
     async def listen(max_seconds: float = 6.0, device_id: str = "") -> dict[str, Any]:
-        """打开麦克风听用户说话，并返回识别出的文字。
+        """打开麦克风听用户说话并返回识别文字 —— 只在用户明确要求「你来听」时才用。
 
-        用于用户说「听我说」「你来听」之后需要主动采集一轮语音的场合。
-        普通的对话输入由系统自动处理，不需要调用本工具。
+        用户说的话**系统已经自动转成文字给你了**，所以：
+        * 不要为了「听清一点」「确认能不能听见」「再听一遍」调用它 ——
+          一次要采集 5~6 秒，用户干等；实测这是响应变慢的最大来源；
+        * 只有用户说「听我说」「你来听」这类**明确要求采集**时才调用。
 
         Args:
             max_seconds: 最长采集时长秒数，1~15。

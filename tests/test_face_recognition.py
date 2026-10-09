@@ -88,6 +88,9 @@ def build_settings(face_path: Path) -> Settings:
     settings.behavior.min_command_interval_ms = 0
     # 隔离：绝不能让测试写到真实的人脸库。
     settings.face.path = str(face_path)
+    # 关掉扫描缓存：这些用例会**在一轮对话中途换人/换光线**，缓存会让它们
+    # 看到旧结果（缓存本身另有专门用例覆盖）。
+    settings.face.scan_ttl_s = 0.0
     # 长期记忆同样要隔离 —— 否则测试里的"王五"会写进用户真实的 facts.jsonl。
     settings.memory.path = str(face_path.parent / "facts.jsonl")
     return settings
@@ -328,6 +331,44 @@ async def test_too_dark(served: ServedApp, rt: SparkBotRuntime) -> None:
     await robot.conn.command("config", {"face_people": ["张三"], "face_luma": 42})
 
 
+async def test_scan_cache(rt: SparkBotRuntime) -> None:
+    """阶段 8：人脸扫描在对话内复用，新会话必须重扫。
+
+    背景：设备端一次"检测 + 提特征"要 1.4~2.3 秒，而同一轮对话里脸不会变 ——
+    每轮重扫就是每轮白等两秒（用户感受："说完话反应有点迟钝"）。
+    但**新一次唤醒**很可能是另一个人，必须重扫，不能把新人认成上一个。
+    """
+    logger.info("阶段 8 · 人脸扫描缓存")
+    agent = rt.agents.get()
+    robot = rt.robots.get()
+    rt.settings.face.scan_ttl_s = 20.0
+    # 前面几个阶段刚扫过，先把缓存清掉，从"干净状态"开始数
+    agent.invalidate_face_cache()
+    calls: list[int] = []
+    original = robot.identify_faces
+
+    async def spy(*args, **kwargs):
+        calls.append(1)
+        return await original(*args, **kwargs)
+
+    robot.identify_faces = spy  # type: ignore[method-assign]
+    try:
+        await rt.chat("你好呀", announce=False)
+        check(len(calls) == 1, "第一轮做了人脸扫描", f"{len(calls)} 次")
+
+        await rt.chat("再说一句", announce=False)
+        check(len(calls) == 1, "紧接着的下一轮复用缓存、不再扫（省 1~2 秒）",
+              f"{len(calls)} 次")
+
+        agent.invalidate_face_cache()
+        await rt.chat("还在吗", announce=False)
+        check(len(calls) == 2, "新会话开始时强制重扫（换了人也能认对）",
+              f"{len(calls)} 次")
+    finally:
+        robot.identify_faces = original  # type: ignore[method-assign]
+        rt.settings.face.scan_ttl_s = 0.0
+
+
 async def test_partial_feature(served: ServedApp, rt: SparkBotRuntime) -> None:
     """阶段 7：设备报"检测到 N 张"但特征回传不完整时，必须显式报出来。
 
@@ -396,6 +437,7 @@ async def main() -> int:
             await test_delete_and_privacy(served, rt)
             await test_too_dark(served, rt)
             await test_partial_feature(served, rt)
+            await test_scan_cache(rt)
         finally:
             await device.stop()
             with contextlib.suppress(asyncio.CancelledError, Exception):

@@ -28,6 +28,7 @@ from sparkbot.paths import ensure_path  # noqa: E402
 ensure_path()
 
 from sparkbot.brain.memory import Memory  # noqa: E402
+from sparkbot.brain.agent import strip_model_artifacts  # noqa: E402
 from sparkbot.llm.base import ChatMessage, ToolCallRequest  # noqa: E402
 
 _PASSED: list[str] = []
@@ -134,6 +135,29 @@ def test_normal_history_untouched() -> None:
     check(ok, "正常历史本身也满足配对约束", why)
 
 
+def test_strip_model_artifacts() -> None:
+    """阶段 5：模型漏出来的内部标记必须清掉（否则会被念给用户听）。
+
+    实测原始回复：
+        '不客气～ <issue_start>show_emotion: love<issue_end>\\n<paren_end>'
+    """
+    print("\n阶段 5 · 清理模型内部标记")
+    check(strip_model_artifacts("不客气～") == "不客气～", "正常回复原样保留")
+    check(
+        strip_model_artifacts("不客气～ <issue_start>show_emotion: love<issue_end>\n<paren_end>")
+        == "不客气～",
+        "成对标记与孤立标签都被清掉",
+        repr(strip_model_artifacts("不客气～ <issue_start>show_emotion: love<issue_end>\n<paren_end>")),
+    )
+    check(
+        strip_model_artifacts("好的 <issue_start>show_emotio") == "好的",
+        "被截断的 <issue_start> 之后一律截掉（max_tokens 截断时会出现）",
+    )
+    check(strip_model_artifacts("") == "", "空文本不出错")
+    check(strip_model_artifacts("1 < 2 且 3 > 2") == "1 < 2 且 3 > 2",
+          "普通比较符号不受影响")
+
+
 def test_pair_survives_trimming() -> None:
     """阶段 4：裁剪时整组一起丢，不留下半组。"""
     print("\n阶段 4 · 裁剪保持成组")
@@ -157,6 +181,7 @@ def main() -> int:
     test_orphan_tool_message()
     test_dangling_tool_calls()
     test_normal_history_untouched()
+    test_strip_model_artifacts()
     test_pair_survives_trimming()
     print("=" * 64)
     total = len(_PASSED) + len(_FAILED)
