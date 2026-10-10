@@ -1,6 +1,9 @@
 # Python 虚拟环境（本机依赖，不入库）
 .venv/
 
+# MOSS-TTS-Nano 的独立虚拟环境（torch 2.8 + torchaudio 2.8 + transformers 4.57）
+.venv-moss/
+
 # ModelScope 模型缓存（约 900MB，首次运行自动下载）
 modelscope-cache/
 
@@ -9,6 +12,9 @@ models/
 
 # 运行期 HOME：内含 .modelscope 凭据，绝不能入库
 home/
+
+# HF 缓存（transformers 加载自定义模型代码时写这里），不入库
+hf-home/
 
 # torch 编译缓存
 torchinductor_*/
@@ -22,6 +28,9 @@ jieba.cache
 
 # 基准测试输出（音频样本）
 bench/
+
+# TTS 合成时落的临时 wav（服务跑完就删，不入库）
+generated_audio/
 
 # 编辑器
 .vscode/

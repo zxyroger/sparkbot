@@ -5,7 +5,7 @@ REM
 REM  Brings up THREE processes (the full local, no-cloud-cost setup):
 REM
 REM    1. ASR service   :8760   SenseVoice on CPU  (speech -> text)
-REM    2. TTS service   :8761   edge-tts           (text -> speech)
+REM    2. TTS service   :8761   MOSS-TTS-Nano      (text -> speech, offline CPU)
 REM    3. SparkBot      :8765   main server        (this window, foreground)
 REM
 REM  ASR and TTS run minimized in their own windows. The main server runs HERE
@@ -25,7 +25,8 @@ REM    SPARKBOT_SPEECH_ASR_BASE_URL=http://127.0.0.1:8760/v1
 REM    SPARKBOT_SPEECH_ASR_MODEL=iic/SenseVoiceSmall
 REM    SPARKBOT_SPEECH_TTS_PROVIDER=openai
 REM    SPARKBOT_SPEECH_TTS_BASE_URL=http://127.0.0.1:8761/v1
-REM    SPARKBOT_SPEECH_TTS_MODEL=edge-tts
+REM    SPARKBOT_SPEECH_TTS_MODEL=moss
+REM    SPARKBOT_SPEECH_TTS_VOICE=Junhao
 REM
 REM  NOTE: ASCII-only on purpose. A .bat saved as UTF-8 without BOM gets read
 REM  as ANSI/GBK by cmd.exe and turns into garbage commands. Chinese docs live
@@ -106,8 +107,11 @@ if defined BUSY (
     echo   [SKIP] TTS already listening on %TTS_PORT%
     goto after_tts
 )
-if not exist "%SPEECH_DIR%\.venv\Scripts\python.exe" (
-    echo   [WARN] TTS venv not found, skipping
+REM The TTS service has its own venv (.venv-moss): its torchaudio pin cannot
+REM coexist with the ASR venv's torch version. See speech-service\start_tts.bat.
+if not exist "%SPEECH_DIR%\.venv-moss\Scripts\python.exe" (
+    echo   [WARN] TTS venv not found at %SPEECH_DIR%\.venv-moss
+    echo          see speech-service\README.md to set it up
     goto after_tts
 )
 REM NOTE: the TTS service must NOT inherit the ASR HOME override - that would
@@ -115,7 +119,7 @@ REM break other things that rely on the real home directory. start_tts.bat
 REM handles that by simply not setting HOME.
 REM Same quoting rule as the ASR line above: call the child .bat directly.
 start "SparkBot TTS" /min cmd /c ""%SPEECH_DIR%\start_tts.bat" %TTS_PORT%"
-echo   [OK]   TTS service starting on %TTS_PORT%  (ready in ~2s, online API)
+echo   [OK]   TTS service starting on %TTS_PORT%  (offline CPU, model load ~10s)
 :after_tts
 
 REM ---- 3. main server (foreground) ----------------------------------------

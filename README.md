@@ -791,6 +791,9 @@ export SPARKBOT_SPEECH_TTS_VOICE=alloy
 
 留空或设为 `mock` 时离线工作：ASR 返回占位文本，TTS 输出提示音 WAV。
 
+本地 `speech-service/` 默认跑 **MOSS-TTS-Nano**（离线、纯 CPU），对应配置是
+`SPARKBOT_SPEECH_TTS_MODEL=moss`、`SPARKBOT_SPEECH_TTS_VOICE=Junhao`。
+
 全部配置项见 `.env.example`，也可以在控制台「设置」页里改其中大部分。
 
 #### 流式识别与流式合成（默认走本地 `speech-service/`）
@@ -913,7 +916,7 @@ start_all.ps1       PowerShell 等价入口（受执行策略限制，见脚本�
 check.py            启动前自检：一条命令定位「为什么起不来」
 tests/              三个测试套件 + 手动联调脚本
 sparkbot-esp32/     ESP32-S3 固件源码（ESP-IDF 工程，见其 README）
-speech-service/     本地语音服务：ASR(SenseVoice + 流式 Paraformer) / TTS(sherpa-onnx)
+speech-service/     本地语音服务：ASR(SenseVoice + 流式 Paraformer) / TTS(MOSS-TTS-Nano)
 logs/               脚本启动时的运行日志（.gitignore 已忽略）
 ```
 

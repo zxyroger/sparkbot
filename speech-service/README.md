@@ -1,6 +1,6 @@
-# 本地语音服务（SenseVoice ASR + Kokoro TTS）
+# 本地语音服务（SenseVoice ASR + MOSS-TTS-Nano TTS）
 
-CPU 上本地部署的语音识别服务，提供 OpenAI 兼容接口，供 `D:\dsh\sparkbot`
+CPU 上本地部署的语音服务（识别 + 合成），提供 OpenAI 兼容接口，供 `D:\dsh\sparkbot`
 主项目调用。**不需要 GPU、不需要云 API、不产生费用。**
 
 ---
@@ -21,7 +21,7 @@ start_stack.bat
 | 服务 | 端口 | 说明 |
 |---|---|---|
 | ASR（SenseVoice） | 8760 | 后台最小化窗口，模型加载约 12~15 秒 |
-| TTS（edge-tts） | 8761 | 后台最小化窗口，约 2 秒就绪 |
+| TTS（MOSS-TTS-Nano） | 8761 | 后台最小化窗口，离线 CPU，模型加载约 10 秒 |
 | 主服务 SparkBot | 8765 | **在当前窗口前台运行**，日志实时可见 |
 
 参数：
@@ -254,7 +254,119 @@ Kokoro 模型约 450MB + pip 缓存（在 `D:\dsh\.tmp`）。
 
 ---
 
-## TTS：sherpa-onnx（默认）/ Kokoro（备选）
+## TTS：MOSS-TTS-Nano（默认）
+
+`moss_tts_server.py` 是现在的默认 TTS。它和 `tts_server.py` 提供**同一套**
+OpenAI 兼容接口，主项目只改 `speech.tts_model` / `speech.tts_base_url` 就能换引擎，
+不用动一行代码。
+
+用的是 [MOSS-TTS-Nano](https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Nano-100M)
+（MOSI.AI + 复旦 OpenMOSS 开源）：
+
+| 项 | 值 |
+|---|---|
+| 参数 | 0.1B（100M） |
+| 硬件 | 纯 CPU，不需要 GPU |
+| 网络 | 完全离线 |
+| 输出 | 原生 48kHz 立体声（服务端重采样到 16kHz 单声道给板子） |
+| 音色 | 声音克隆：给一段参考音频就能定音色 |
+| 许可 | Apache-2.0 |
+
+### 为什么换掉 sherpa / edge-tts
+
+* edge-tts 是**在线**服务（微软免费接口），实测会 502/503，机器人播报直接失败；
+* sherpa 的中文 VITS 只有 131MB，音色「能听」但明显发闷；
+* MOSS-TTS-Nano 只有 0.1B 参数，CPU 上跑得动，音质明显更好，而且完全离线。
+
+### 环境与依赖（单独一个 venv，重要）
+
+MOSS-TTS-Nano 的官方代码 `import torchaudio`，而 **torchaudio 在 2.9 之后停止发版**
+（2.8.0 是最后一个配 torch 2.8.x 的版本）。ASR 的 `.venv` 里是 torch 2.14.1，
+根本没有对应的 torchaudio —— 两者无法共存，所以 TTS 单独用 `.venv-moss`，
+版本组合照抄官方 Space 验证过的那套：
+
+| 依赖 | 版本 |
+|---|---|
+| torch | 2.8.0+cpu |
+| torchaudio | 2.8.0+cpu |
+| transformers | 4.57.1 |
+| sentencepiece / soundfile | 最新 |
+| fastapi / uvicorn / pydantic | 同主服务 |
+
+好处是**完全不碰** `.venv`，ASR 那边照旧工作。
+
+### 安装与模型下载
+
+```powershell
+cd D:\dsh\sparkbot\speech-service
+
+# 1) 建独立 venv
+& 'C:\Program Files\Python313\python.exe' -m venv .venv-moss
+
+# 2) 依赖。国内走清华镜像；torch / torchaudio 走 PyTorch 官方 CPU 源。
+#    注意 TMP/TEMP 必须指向可写盘，否则 pip 会报 No usable temporary directory
+$env:TMP='D:\dsh\.tmp'; $env:TEMP='D:\dsh\.tmp'
+.venv-moss\Scripts\python.exe -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple `
+    numpy==2.2.6 sentencepiece soundfile "fastapi>=0.115" "uvicorn[standard]>=0.34" `
+    "pydantic>=2.10" "huggingface_hub>=0.34" transformers==4.57.1
+.venv-moss\Scripts\python.exe -m pip install --index-url https://download.pytorch.org/whl/cpu `
+    torch==2.8.0 torchaudio==2.8.0
+
+# 3) 权重（约 310MB）。HuggingFace 直连不通，走 hf-mirror。
+$env:HF_ENDPOINT='https://hf-mirror.com'
+.venv\Scripts\python.exe -c @"
+from huggingface_hub import snapshot_download
+root = r'D:\dsh\sparkbot\speech-service\models\moss'
+snapshot_download('OpenMOSS-Team/MOSS-TTS-Nano-100M', local_dir=root + r'\tts',
+    allow_patterns=['*.json', '*.py', '*.bin', '*.model', '*.txt'])
+snapshot_download('OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano', local_dir=root + r'\codec',
+    allow_patterns=['*.json', '*.py', '*.safetensors', '*.txt'])
+"@
+```
+
+实测 `pytorch_model.bin`（223MB）用 huggingface_hub 下到 0 字节就卡住不动，
+换成 `curl -L -C -` 直接下 `.../resolve/main/pytorch_model.bin` 才通 —— 卡住时照这个来。
+
+### 参考音色（声音克隆）
+
+模型靠**参考音频**定音色，参考音色放在 `models/moss/voices/`（不入库）。
+仓库预置了 4 个，取自官方 Space 的 `assets/audio/`：
+
+| 音色名 | 参考文件 | 说明 |
+|---|---|---|
+| `Junhao`（默认） | `zh_1.wav` | 中文男声 A |
+| `Xiaoyu` | `zh_3.wav` | 中文女声 A |
+| `Yuewen` | `zh_4.wav` | 中文女声 B |
+| `Lingyu` | `zh_6.wav` | 中文女声 C |
+
+想换音色：把一段 5~15 秒的干净人声 wav 丢进 `models/moss/voices/`，
+在 `moss_tts_server.py` 的 `VOICE_PRESETS` 里加一行即可 —— **不需要训练**。
+请求里的 `voice` 也可以直接写参考音频的绝对路径。
+
+### 排障开关
+
+| 命令 | 行为 |
+|---|---|
+| `start_tts.bat` | 默认 `Junhao`，启动即预热模型 |
+| `start_tts.bat 8761 Xiaoyu` | 换默认音色 |
+| `moss_tts_server.py --no-preload` | 启动不加载模型，首个请求再加载 |
+| `moss_tts_server.py --threads 8` | 指定 torch 线程数 |
+| `moss_tts_server.py --nq 8` | 少用音频码本：更快、音质略降 |
+
+`GET /health` 回报 `ready` / `error` / `load_seconds` / `voices`；
+`POST /v1/audio/speech` 的响应头带 `X-TTS-Engine` / `X-Synth-Ms` / `X-Audio-Seconds`。
+
+### 已知限制
+
+* 模型不支持变速，请求里的 `speed` 会被忽略；
+* 没做数字/日期文本正规化（官方用 WeTextProcessing，Windows 上装 pynini 比较费劲）。
+  「三点半」这类中文写法没问题，纯阿拉伯数字偶尔读得生硬；
+* 服务端**整段合成后一次性下发**，不做真流式 —— 板子实测连续小块喂 I2S 会「呲呲」，
+  和提交「播报不再走流式」保持一致。
+
+---
+
+## 备选 TTS：sherpa-onnx / Kokoro / edge-tts
 
 `tts_server.py` 提供 `/v1/audio/speech`，主项目把 `speech.tts_provider`
 设成 `openai`、base_url 指向本服务即可。服务内置三个离线/在线引擎，
@@ -428,8 +540,10 @@ misaki 的中文 G2P 在没有英文前端时会丢掉英文单词（启动时�
 |---|---|
 | `server.py` | ASR 服务（FastAPI，OpenAI 兼容） |
 | `start_asr.bat` | 启动脚本（含全部环境变量处理） |
-| `tts_server.py` | TTS 服务（Kokoro 离线 + edge-tts 兜底） |
-| `start_tts.bat` | TTS 启动脚本 |
+| `moss_tts_server.py` | **默认** TTS 服务（MOSS-TTS-Nano，离线 CPU） |
+| `tts_server.py` | 备选 TTS 服务（Kokoro 离线 + edge-tts 兜底） |
+| `start_tts.bat` | TTS 启动脚本（拉起 `.venv-moss` 里的 MOSS-TTS-Nano） |
+| `models/moss/` | MOSS-TTS-Nano 权重 + 参考音色（约 310MB，可删，见上文重新下载） |
 | `models/kokoro/` | Kokoro 模型与声线（约 450MB，可删，见上文重新下载） |
 | `models/sherpa/` | sherpa-onnx 模型（131MB，可删，见上文重新下载） |
 | `benchmark.py` | 实测脚本：准确率（CER）+ 延迟（RTF） |
