@@ -334,10 +334,10 @@ snapshot_download('OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano', local_dir=root + r'
 
 | 音色名 | 参考文件 | 说明 |
 |---|---|---|
-| `Junhao`（默认） | `zh_1.wav` | 中文男声 A |
+| `Junhao` | `zh_1.wav` | 中文男声 A |
 | `Xiaoyu` | `zh_3.wav` | 中文女声 A |
 | `Yuewen` | `zh_4.wav` | 中文女声 B |
-| `Lingyu` | `zh_6.wav` | 中文女声 C |
+| `Lingyu`（默认） | `zh_6.wav` | 中文女声 C |
 
 想换音色：把一段 5~15 秒的干净人声 wav 丢进 `models/moss/voices/`，
 在 `moss_tts_server.py` 的 `VOICE_PRESETS` 里加一行即可 —— **不需要训练**。
@@ -347,7 +347,7 @@ snapshot_download('OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano', local_dir=root + r'
 
 | 命令 | 行为 |
 |---|---|
-| `start_tts.bat` | 默认 `Junhao`，启动即预热模型 |
+| `start_tts.bat` | 默认 `Lingyu`，启动即预热模型 |
 | `start_tts.bat 8761 Xiaoyu` | 换默认音色 |
 | `moss_tts_server.py --no-preload` | 启动不加载模型，首个请求再加载 |
 | `moss_tts_server.py --threads 8` | 指定 torch 线程数 |

@@ -24,9 +24,10 @@ REM  writable here and model loading needs a scratch dir.
 REM
 REM  Usage:  start_tts.bat              (default 127.0.0.1:8761)
 REM          start_tts.bat 9001         (custom port)
-REM          start_tts.bat 8761 Xiaoyu  (another voice)
+REM          start_tts.bat 8761 Junhao  (another voice)
 REM
-REM  Built-in voices: Junhao (male), Xiaoyu / Yuewen / Lingyu (female).
+REM  Built-in voices: Lingyu (default, female), Xiaoyu / Yuewen (female),
+REM  Junhao (male).
 REM
 REM  NOTE: ASCII-ONLY ON PURPOSE - see the comment in start_asr.bat.
 REM ============================================================
@@ -35,7 +36,7 @@ setlocal
 set PORT=%1
 if "%PORT%"=="" set PORT=8761
 set VOICE=%2
-if "%VOICE%"=="" set VOICE=Junhao
+if "%VOICE%"=="" set VOICE=Lingyu
 
 cd /d "%~dp0"
 

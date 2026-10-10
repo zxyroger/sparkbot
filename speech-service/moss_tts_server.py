@@ -101,8 +101,8 @@ VOICE_PRESETS: dict[str, tuple[str, str]] = {
     "lingyu": ("zh_6.wav", "中文女声 C"),
 }
 
-#: 默认音色（官方 demo 也是这个）。main() 里可被命令行覆盖。
-DEFAULT_VOICE = "Junhao"
+#: 默认音色。PC 端一般会自己带 voice，这里只是兜底。main() 里可被命令行覆盖。
+DEFAULT_VOICE = "Lingyu"
 
 #: 生成参数，取官方 Space 运行时的默认值。
 GEN_DEFAULTS: dict[str, Any] = {
